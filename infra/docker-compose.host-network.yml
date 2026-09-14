@@ -55,5 +55,15 @@ services:
       # gathers usable candidates by itself.
       - MTX_WEBRTCADDITIONALHOSTS=
 
+  # THE SERVER CONFIGURES CADDY THROUGH THIS, and it is the only reason it
+  # can. Both containers on `network_mode: host` share one network namespace,
+  # so Caddy's admin API on 127.0.0.1:2019 is reachable from the server
+  # process - which is how a certificate the portal just issued reaches the
+  # TLS front door with no restart, no Docker socket and no hand-edited
+  # `.env`. See server/src/licensing/caddy.ts and infra/caddy/Caddyfile.
+  #
+  # The endpoint is pinned to 127.0.0.1 in the Caddyfile rather than left on
+  # a default, because in THIS namespace a wildcard bind is the customer's
+  # LAN.
   caddy:
     network_mode: host

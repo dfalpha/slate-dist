@@ -143,16 +143,27 @@ services:
       # One path, publisher-fed. Nothing else may be published here.
       - MTX_PATHS_DOORBELL_SOURCE=publisher
 
-  # Reverse proxy / TLS termination (issue 0.9, spec 5.1): DNS-01 via
-  # Cloudflare, one instance per host - an additional HTTPS front door
-  # alongside `server`'s existing direct :8080 HTTP access, not a
-  # replacement for it. CLOUDFLARE_API_TOKEN/SLATE_HOSTNAME/SLATE_UPSTREAM
-  # are container-level secrets Caddy needs on its own - it can't call into
-  # the Slate admin API for its own TLS credentials the way the Node
-  # server's settings (0.8) work - so they come from the same host-local
-  # `.env`, not from Slate's own config DB. Pulls a published image (issue
-  # 0.11), built/pushed by CI's publish-caddy job - no local build needed
-  # on any host.
+  # Reverse proxy / TLS termination (issue 0.9, spec 5.1): an additional
+  # HTTPS front door alongside `server`'s existing direct :8080 HTTP access,
+  # not a replacement for it. Pulls a published image (issue 0.11),
+  # built/pushed by CI's publish-caddy job - no local build needed on any
+  # host.
+  #
+  # IT READS NO ENVIRONMENT OF ITS OWN ANY MORE, and that is a change worth
+  # noticing. `CLOUDFLARE_API_TOKEN` went when the portal took over issuance;
+  # `SLATE_HOSTNAME` and `SLATE_UPSTREAM` went when the SERVER took over
+  # configuring it, over Caddy's admin API on loopback
+  # (server/src/licensing/caddy.ts). `infra/caddy/Caddyfile` is now a
+  # bootstrap: enough for Caddy to start and be talked to on an install that
+  # has no name yet, which is what every install is before its account is
+  # linked. The `env_file` below is kept because it costs nothing and a host
+  # that still sets those variables is not broken by them being ignored.
+  #
+  # THIS ONLY WORKS UNDER `infra/docker-compose.host-network.yml`, where
+  # `server` and `caddy` share one network namespace and so one loopback.
+  # That is the supported deployment (see that file). On the plain bridge
+  # network Caddy starts, serves nothing, and says so - the server's :8080
+  # HTTP access is unaffected, which is what makes that survivable.
   # PINNED TO :production, NOT :latest, AND THAT IS THE WHOLE POINT.
   #
   # This container is the TLS front door. On `:latest` with the Watchtower

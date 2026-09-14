@@ -57,6 +57,13 @@
     SLATE_GHCR_USER / SLATE_GHCR_TOKEN, if set in this session, are passed into
     the distro (WSLENV) for the Linux installer's fallback when the images or
     the mirror are still private. Nothing here needs them otherwise.
+
+    SLATE_ADMIN_PASSWORD travels the same way. SlateSetup.exe collects it on a
+    wizard page and puts it in this process's environment; with it set, the
+    Linux installer asks nothing at all. Run from the bare one-liner instead,
+    it is simply unset and the Linux installer asks for it on the console. It
+    is never printed here and never appears on a command line - a command line
+    is readable by every user on the machine, an environment block is not.
 #>
 [CmdletBinding()]
 param(
@@ -245,8 +252,12 @@ function Invoke-LinuxInstaller {
     # without this script guessing the mount root. Same pattern the setup
     # script uses for /etc/wsl.conf, proven on the production host.
     $lin = 'sh "$(wslpath -u ' + "'$shPath'" + ')"'
-    # Passed through for the Linux installer's fallback only; empty otherwise.
-    $env:WSLENV = 'SLATE_GHCR_USER:SLATE_GHCR_TOKEN:SLATE_DIST_RAW'
+    # Forwarded into the distro. WSLENV names variables to copy out of THIS
+    # process's environment, so an unset one simply arrives empty: the GHCR
+    # pair is for the private-images fallback, and SLATE_ADMIN_PASSWORD is
+    # what SlateSetup.exe's wizard page collected. Empty means "not set" on
+    # the Linux side, which then asks for it on the console.
+    $env:WSLENV = 'SLATE_GHCR_USER:SLATE_GHCR_TOKEN:SLATE_DIST_RAW:SLATE_ADMIN_PASSWORD'
     $ok = Invoke-Action "wsl -d $Distro -u root -e sh -c `"$lin`"" {
         & wsl.exe -d $Distro -u root -e sh -c $lin
     }
@@ -289,9 +300,10 @@ function Show-Finish {
     Write-Host "Admin panel:"
     if ($ip) { Write-Host "  http://${ip}:8080/admin" } else { Write-Host "  http://<this-pc-lan-ip>:8080/admin" }
     Write-Host ""
-    Write-Host "Log in as 'admin' with the SLATE_ADMIN_PASSWORD you just set, then"
-    Write-Host "change it from the Users tab. The stack lives at /opt/slate inside the"
-    Write-Host "distro ('wsl -d $Distro' opens a shell there); re-running this line is safe."
+    Write-Host "Log in as 'admin' with the password you set during this install,"
+    Write-Host "then change it from the Users tab whenever you like. The stack lives at"
+    Write-Host "/opt/slate inside the distro ('wsl -d $Distro' opens a shell there);"
+    Write-Host "re-running this line is safe - it keeps every value already in .env."
     Write-Host ""
     # The device-link code is minted by the server when an admin starts a link
     # and is read back only through the authenticated admin API; there is no

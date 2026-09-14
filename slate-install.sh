@@ -4,9 +4,16 @@
 #
 # Installs Docker Engine + the compose plugin if missing, fetches the two
 # compose files this stack needs from the public dist mirror, pulls the public
-# images, writes a host-local .env from prompts, brings the stack up, and then
-# VERIFIES that the containers really are on the host's own network before
-# declaring success.
+# images, writes a host-local .env, brings the stack up, and then VERIFIES that
+# the containers really are on the host's own network before declaring success.
+#
+# IT ASKS FOR ONE THING: the admin panel's password. Everything else in
+# .env.example is either legitimately empty, ships a correct default, or has
+# one this script knows better (env_installer_default) - so there is nothing
+# for a customer to decide and nothing for them to get wrong. Set
+# SLATE_ADMIN_PASSWORD in the environment and it asks for nothing at all,
+# which is the path the Windows installer takes (its wizard collects it and
+# forwards it into the distro through WSLENV).
 #
 # No credential is needed. The images are public packages on ghcr.io and the
 # files come from https://github.com/dfalpha/slate-dist, a public mirror of
@@ -142,6 +149,9 @@ Options:
   -h, --help           This text.
 
 Environment (all optional):
+  SLATE_ADMIN_PASSWORD The password for the admin panel's `admin` account. Set
+                       it and the installer asks nothing at all; leave it unset
+                       and it is the one thing you are prompted for.
   SLATE_INSTALL_DIR    Same as --install-dir.
   SLATE_DIST_RAW       Base URL of the public dist mirror (for testing).
   SLATE_GHCR_USER      Only for the fallback below: GitHub username.
@@ -160,8 +170,9 @@ What it does:
   2. Installs Docker Engine + the compose plugin (apt or dnf) if absent.
   3. Fetches docker-compose.yml, infra/docker-compose.host-network.yml and
      .env.example from the dist mirror, anonymously.
-  4. Writes <install-dir>/.env from prompts, using .env.example as the source
-     of truth for which variables exist. Mode 0600, never inside a checkout.
+  4. Asks for the admin panel password - the only thing it asks - and writes
+     <install-dir>/.env, using .env.example as the source of truth for which
+     variables exist. Mode 0600, never inside a checkout.
   5. Pulls the public images and brings the stack up with host networking.
   6. VERIFIES host networking - container network namespace vs the host's,
      plus an mDNS sanity probe - and fails loudly with the reason if it is
@@ -596,44 +607,11 @@ env_example_vars() {
     sed -n 's/^\([A-Za-z_][A-Za-z0-9_]*\)=.*/\1/p' "$1"
 }
 
-# The comment block immediately above a variable in .env.example, verbatim.
-# Blank lines separate blocks; a block covers every variable under it.
-env_example_help() {
-    awk -v want="$2" '
-        /^[[:space:]]*$/ { buf = ""; next }
-        /^#/ {
-            line = $0
-            sub(/^#[[:space:]]?/, "", line)
-            buf = (buf == "" ? line : buf "\n" line)
-            next
-        }
-        /^[A-Za-z_][A-Za-z0-9_]*=/ {
-            name = $0
-            sub(/=.*/, "", name)
-            if (name == want) { print buf; exit }
-        }
-    ' "$1"
-}
-
 # Existing value for a variable in an existing .env, so a re-run keeps what is
 # already configured instead of asking the operator to retype it.
 env_current_value() {
     [ -f "$1" ] || return 0
     sed -n "s/^$2=//p" "$1" | head -n 1
-}
-
-# $1 = variable name, $2 = the value .env.example ships for it. A boolean flag
-# is never a secret however it is named - SLATE_RESET_ADMIN_PASSWORD is the
-# live example - and deriving that from .env.example keeps this script free of
-# a hand-maintained list of variables.
-is_secret_var() {
-    case "${2:-}" in
-        true|false) return 1 ;;
-    esac
-    case "$1" in
-        *TOKEN*|*PASSWORD*|*SECRET*|*_KEY|*APIKEY*) return 0 ;;
-        *) return 1 ;;
-    esac
 }
 
 # Defaults this installer knows better than .env.example does, because this
@@ -652,13 +630,93 @@ env_installer_default() {
     esac
 }
 
+# The value a variable gets when nobody is asked for it. In order:
+#   1. what an existing .env already has - a re-run keeps this install's
+#      answers, including a hostname the portal assigned since last time;
+#   2. what this installer knows better than .env.example does, because it
+#      only ever builds the host-networking shape (env_installer_default);
+#   3. what .env.example ships, which is the shipped default for everything
+#      else and empty where empty is the right answer.
+# $1 variable, $2 the existing .env, $3 .env.example.
+env_resolved_value() {
+    resolved=$(env_current_value "$2" "$1")
+    [ -n "$resolved" ] || resolved=$(env_installer_default "$1")
+    [ -n "$resolved" ] || resolved=$(env_current_value "$3" "$1")
+    printf '%s' "$resolved"
+}
+
+# The admin panel enforces 8 characters on every password it sets itself
+# (server/src/adminApi.ts), so accepting a shorter one here would hand the
+# customer a password the panel would then refuse to let them keep.
+ADMIN_PASSWORD_MIN=8
+ADMIN_PASSWORD=""
+
+# The ONE question this installer asks, and only when it has to. $1 is whatever
+# an existing .env already holds.
+#
+# Not asked at all when SLATE_ADMIN_PASSWORD is already in the environment -
+# that is how the Windows installer works (its wizard collects it and WSLENV
+# carries it into the distro) and how an unattended install works - or when a
+# previous run already wrote one.
+read_admin_password() {
+    if [ -n "${SLATE_ADMIN_PASSWORD:-}" ]; then
+        ADMIN_PASSWORD="$SLATE_ADMIN_PASSWORD"
+        info "Admin password: taken from SLATE_ADMIN_PASSWORD; nothing to ask."
+        return 0
+    fi
+    if [ -n "$1" ]; then
+        ADMIN_PASSWORD="$1"
+        info "Admin password: keeping the one already in .env."
+        return 0
+    fi
+    if [ "$PROMPT_IN" != /dev/tty ]; then
+        die "There is no terminal to ask for the admin password on, and no existing .env to take one from. Set SLATE_ADMIN_PASSWORD in the environment and re-run."
+    fi
+
+    printf '\n'
+    info "Choose the password for the Slate admin panel. It is the only thing"
+    info "this installer needs from you - everything else has a correct default."
+    info "The username is 'admin' and cannot be changed here."
+    info "At least $ADMIN_PASSWORD_MIN characters. Input is hidden."
+    while :; do
+        read_secret "Admin password"
+        admin_first="$PROMPT_RESULT"
+        PROMPT_RESULT=""
+        if [ "${#admin_first}" -lt "$ADMIN_PASSWORD_MIN" ]; then
+            printf '  Too short - at least %s characters. Try again.\n' \
+                "$ADMIN_PASSWORD_MIN" >&2
+            admin_first=""
+            continue
+        fi
+        read_secret "Confirm password"
+        admin_second="$PROMPT_RESULT"
+        PROMPT_RESULT=""
+        if [ "$admin_first" != "$admin_second" ]; then
+            printf '  Those do not match. Try again.\n' >&2
+            admin_first=""
+            admin_second=""
+            continue
+        fi
+        ADMIN_PASSWORD="$admin_first"
+        admin_first=""
+        admin_second=""
+        break
+    done
+}
+
 write_env() {
     step "Configuration ($INSTALL_DIR/.env)"
 
     if [ "$DRY_RUN" -eq 1 ]; then
-        info "[dry-run] would read the variable list out of .env.example,"
-        info "[dry-run] prompt for each (hiding secrets, defaulting to any"
-        info "[dry-run] existing value), and write $INSTALL_DIR/.env mode 0600."
+        info "[dry-run] would write $INSTALL_DIR/.env (mode 0600) with every"
+        info "[dry-run] variable in .env.example, taking each value from an"
+        info "[dry-run] existing .env, then this installer's own defaults, then"
+        info "[dry-run] .env.example's."
+        if [ -n "${SLATE_ADMIN_PASSWORD:-}" ]; then
+            info "[dry-run] SLATE_ADMIN_PASSWORD is already set, so it would ask nothing."
+        else
+            info "[dry-run] the admin panel's password is the only thing it would ask for."
+        fi
         return 0
     fi
 
@@ -668,7 +726,13 @@ write_env() {
 
     [ -f "$example_file" ] || die "$example_file is missing; cannot determine which settings exist."
     if [ -f "$env_file" ]; then
-        info "An existing .env was found - press Enter at any prompt to keep its value."
+        info "An existing .env was found - every value already in it is kept."
+    fi
+
+    # Asked before a line is written, so the question is the first thing on
+    # screen rather than something that interrupts a list of settings.
+    if env_example_vars "$example_file" | grep -qx 'SLATE_ADMIN_PASSWORD'; then
+        read_admin_password "$(env_current_value "$env_file" SLATE_ADMIN_PASSWORD)"
     fi
 
     umask 077
@@ -677,34 +741,15 @@ write_env() {
     printf '# Regenerate by re-running the installer.\n\n' >> "$tmp_file"
 
     for var in $(env_example_vars "$example_file"); do
-        helptext=$(env_example_help "$example_file" "$var")
-        example_value=$(env_current_value "$example_file" "$var")
-        current=$(env_current_value "$env_file" "$var")
-        if [ -z "$current" ]; then
-            current=$(env_installer_default "$var")
-        fi
-
-        printf '\n'
-        if [ -n "$helptext" ]; then
-            printf '%s\n' "$helptext" | sed 's/^/  /'
-        fi
-
-        if is_secret_var "$var" "$example_value"; then
-            if [ -n "$current" ]; then
-                read_secret "$var (input hidden, Enter keeps the current value)"
-                if [ -z "$PROMPT_RESULT" ]; then
-                    PROMPT_RESULT="$current"
-                fi
-            else
-                read_secret "$var (input hidden)"
-            fi
+        if [ "$var" = SLATE_ADMIN_PASSWORD ]; then
+            value="$ADMIN_PASSWORD"
         else
-            read_value "$var" "$current"
+            value=$(env_resolved_value "$var" "$env_file" "$example_file")
         fi
-
-        printf '%s=%s\n' "$var" "$PROMPT_RESULT" >> "$tmp_file"
-        PROMPT_RESULT=""
+        printf '%s=%s\n' "$var" "$value" >> "$tmp_file"
     done
+    value=""
+    ADMIN_PASSWORD=""
 
     mv "$tmp_file" "$env_file"
     chmod 600 "$env_file"
@@ -720,50 +765,34 @@ compose() {
         "$@"
 }
 
-# Caddy serves exactly one site, {$SLATE_HOSTNAME}, with a certificate the
-# portal issues at check-in. With no name there is no site and no certificate,
-# so Caddy cannot start: it exits on a config error and, with a restart policy,
-# does that for ever.
+# CADDY STARTS EVEN WITH NO HOSTNAME, AND THAT IS THE POINT.
 #
-# A nameless install is the NORMAL first install - the portal assigns the name,
-# and you reach the admin panel on the LAN address to link the account that
-# gets you one. So drop caddy from the list rather than leave a container
-# crash-looping in `docker ps` on every new install, which reads as a broken
-# install and is not one.
-services_to_start() {
-    if [ -n "$(env_current_value "$INSTALL_DIR/.env" SLATE_HOSTNAME)" ]; then
-        printf '%s' "$COMPOSE_SERVICES"
-    else
-        printf '%s' "$COMPOSE_SERVICES" | sed 's/ caddy//'
-    fi
-}
-
+# This used to drop caddy from the list when SLATE_HOSTNAME was empty, because
+# the Caddyfile named that variable and a nameless Caddy died on a config
+# error. The Caddyfile no longer references it at all: Caddy boots a valid
+# bootstrap config in every case, and the SERVER pushes it a site over Caddy's
+# admin API on 127.0.0.1:2019 once the account is linked and a certificate
+# exists.
+#
+# So Caddy has to be RUNNING for there to be an admin API to push to. Leave it
+# out of a fresh install and the server has nothing to configure, and HTTPS
+# never comes up however correctly everything else behaves. Do not re-add the
+# optimisation: it is running so that the server can configure it.
 stack_up() {
     step "Starting the stack"
     if [ "$DRY_RUN" -eq 1 ]; then
-        printf '  [dry-run] docker compose -f %s -f %s pull %s   (anonymous; a token is offered only if ghcr.io refuses)\n' \
-            "$INSTALL_DIR/docker-compose.yml" \
-            "$INSTALL_DIR/infra/docker-compose.host-network.yml" \
-            "$COMPOSE_SERVICES"
-        printf '  [dry-run] docker compose -f %s -f %s up -d %s\n' \
-            "$INSTALL_DIR/docker-compose.yml" \
-            "$INSTALL_DIR/infra/docker-compose.host-network.yml" \
-            "$(services_to_start)"
-        info "[dry-run] caddy appears in that list only when SLATE_HOSTNAME is set;"
-        info "[dry-run] with no name there is no site for it to serve."
+        printf '  [dry-run] docker compose -f %s -f %s pull %s   (anonymous; a token is offered only if ghcr.io refuses)
+'             "$INSTALL_DIR/docker-compose.yml"             "$INSTALL_DIR/infra/docker-compose.host-network.yml"             "$COMPOSE_SERVICES"
+        printf '  [dry-run] docker compose -f %s -f %s up -d %s
+'             "$INSTALL_DIR/docker-compose.yml"             "$INSTALL_DIR/infra/docker-compose.host-network.yml"             "$COMPOSE_SERVICES"
+        info "[dry-run] caddy is in that list with or without a hostname - the"
+        info "[dry-run] server configures it over its admin API once linked."
         return 0
     fi
     pull_images
-    wanted=$(services_to_start)
-    if [ "$wanted" != "$COMPOSE_SERVICES" ]; then
-        info "No SLATE_HOSTNAME is set, so HTTPS is not configured yet and caddy"
-        info "is not started. Reach the admin panel over the LAN on port 8080,"
-        info "link this install to your account, then put the name the portal"
-        info "gives you in .env and run this installer again."
-    fi
     # Word splitting is intended here - it is a service list.
     # shellcheck disable=SC2086
-    compose up -d $wanted ||
+    compose up -d $COMPOSE_SERVICES ||
         die "'docker compose up' failed. Run it by hand in $INSTALL_DIR to see why."
     info "Containers started."
 }
@@ -967,9 +996,10 @@ finish() {
         log "  http://<this-host-lan-ip>:8080/admin"
     fi
     printf '\n'
-    log "Log in as 'admin' with the SLATE_ADMIN_PASSWORD you just set, then"
-    log "change it from the Users tab. The stack lives in $INSTALL_DIR;"
-    log "re-running this installer is safe."
+    log "Log in as 'admin' with the password you set during this install, then"
+    log "change it from the Users tab whenever you like. The stack lives in"
+    log "$INSTALL_DIR; re-running this installer is safe - it keeps every"
+    log "value already in .env and asks nothing."
     printf '\n'
     # The device-link code is minted by the server only when an admin starts a
     # link, and it is read back through the authenticated admin API
