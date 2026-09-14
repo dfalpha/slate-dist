@@ -1,0 +1,59 @@
+# Override for hosts running the stack inside a dedicated Linux VM (issue
+# 0.12), not Docker Desktop - Docker Desktop for Windows cannot bridge a
+# container to the real physical LAN under any networking mode tested
+# (--network host, macvlan both confirmed dead ends), which breaks the
+# mDNS-based discovery Ecobee (5.6/5.7) and Cast (7.1) both depend on.
+#
+# On a VM with genuine bridged LAN access (Hyper-V External Switch), plain
+# host networking works as intended. Apply alongside the base file, e.g.:
+#   docker compose -f docker-compose.yml -f infra/docker-compose.host-network.yml \
+#     --profile staging up -d server-staging caddy watchtower
+#
+# All three services are listed here so this one file works on any of the
+# three hosts - compose only starts whichever ones are actually named on
+# the command line.
+#
+# A container on host networking leaves the compose-managed bridge network
+# entirely, so caddy's SLATE_UPSTREAM (normally a compose service name like
+# "server:8080") stops resolving. Set SLATE_UPSTREAM=localhost:8080 in this
+# VM's .env - server/server-staging and caddy share the host's own network
+# namespace here, regardless of which one is actually running.
+#
+# Published ports on the base services are harmlessly discarded under host
+# networking (compose warns "Published ports are discarded when using host
+# network mode" - confirmed, not an error) since the containers listen
+# directly on the host's own network stack instead.
+#
+# `mediamtx` (backlog 5.8 Phase 2, doorbell video) is here for a second
+# reason on top of the mDNS one: its WebRTC leg has to hand the tablets ICE
+# candidates they can actually reach, and a bridged container's own IP is not
+# one. On host networking it advertises the VM's real LAN address with no
+# extra configuration, which is why this - not the bridge network - is the
+# supported deployment for doorbell video. Its RTSP port is pinned to
+# loopback here, because the only publisher is the server sharing this same
+# namespace and there is no reason for the raw feed to be on the LAN at all.
+services:
+  server:
+    network_mode: host
+    environment:
+      # Service names do not resolve in this namespace; the sidecar is simply
+      # the other process on this host.
+      - SLATE_DOORBELL_RTSP_URL=rtsp://127.0.0.1:8554/doorbell
+      - SLATE_DOORBELL_WHEP_URL=http://127.0.0.1:8889/doorbell/whep
+
+  server-staging:
+    network_mode: host
+    environment:
+      - SLATE_DOORBELL_RTSP_URL=rtsp://127.0.0.1:8554/doorbell
+      - SLATE_DOORBELL_WHEP_URL=http://127.0.0.1:8889/doorbell/whep
+
+  mediamtx:
+    network_mode: host
+    environment:
+      - MTX_RTSPADDRESS=127.0.0.1:8554
+      # Unset: on host networking mediamtx sees the real LAN interface and
+      # gathers usable candidates by itself.
+      - MTX_WEBRTCADDITIONALHOSTS=
+
+  caddy:
+    network_mode: host

@@ -1,0 +1,232 @@
+# Slate server stack. Skeleton, to be filled in as the server is built.
+# LAN-only: bind published ports to the host's LAN interface, not 0.0.0.0, in real deployment.
+services:
+  # Production tracks a dedicated :production tag, not :latest - it only
+  # moves when the "Promote Server Build to Production" GitHub Actions
+  # workflow retags a specific, already-published :sha-<commit> build
+  # (issue 0.11 revision). That retag *is* the deliberate trigger;
+  # `watchtower` below just polls normally and picks up the new digest on
+  # its own.
+  server:
+    image: ghcr.io/dfalpha/slate-server:production
+    container_name: slate-server
+    restart: unless-stopped
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
+    ports:
+      - "8080:8080"      # HTTP API + admin + viewer (LAN only)
+      # WebSocket shares the HTTP port; WebRTC signaling rides the same server.
+    volumes:
+      # One volume for the whole SLATE_DATA_DIR tree (config/, recordings/,
+      # slideshow/, eufy/, and whatever future subdirectory the server code
+      # adds) rather than one named volume per subdirectory. The split
+      # version bit twice in one session - a persistence fix landing in code
+      # (slideshow, then eufy) without a matching docker-compose.yml volume
+      # entry, silently wiping that one subdirectory on every redeploy until
+      # someone noticed and manually added a mount for it. A single root
+      # mount makes that class of bug impossible: any subdirectory the code
+      # creates under /data is persisted for free, no compose-file edit or
+      # redeploy needed.
+      - slate-data:/data
+    environment:
+      - NODE_ENV=production
+      - SLATE_DATA_DIR=/data
+      # Doorbell video (backlog 5.8 Phase 2). On the compose bridge network
+      # the sidecar is reachable by service name; the server code's own
+      # defaults are loopback, because the *supported* deployment is host
+      # networking (infra/docker-compose.host-network.yml), where service
+      # names do not resolve at all. Setting both explicitly here means
+      # neither mode depends on remembering which default applies.
+      - SLATE_DOORBELL_RTSP_URL=rtsp://mediamtx:8554/doorbell
+      - SLATE_DOORBELL_WHEP_URL=http://mediamtx:8889/doorbell/whep
+    # Optional, host-local, git-ignored - the one value that still needs an
+    # env var at all: SLATE_ADMIN_PASSWORD, for the very first login before
+    # it can be rotated from the admin panel (issue 0.8). Everything else
+    # the server reads is now admin-editable and DB-stored.
+    env_file:
+      - path: .env
+        required: false
+
+  # Staging instance: same published image as `server`, test config -
+  # differentiated purely by env vars below, not a separate build (issue
+  # 0.11). CI (see .github/workflows/ci.yml, publish job) health-checks this
+  # same image ephemerally inside the GitHub Actions runner on every merge
+  # to main before promoting it to :latest - see infra/README.md. A
+  # persistent staging host pulls that same :latest and is kept current
+  # automatically by `watchtower` below (labeled, interval polling) - no
+  # git checkout or local build ever needed here.
+  #
+  # No such host has existed since 2026-09-07: the staging host was retired
+  # (infra/README.md, "Staging host: decommissioned"). This service is
+  # kept, profile-gated, so staging can be brought back without
+  # re-deriving any of it - it costs nothing while nothing names the
+  # profile.
+  server-staging:
+    image: ghcr.io/dfalpha/slate-server:latest
+    container_name: slate-server-staging
+    restart: unless-stopped
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
+    ports:
+      - "8081:8080"
+    volumes:
+      - slate-data-staging:/data
+    environment:
+      - NODE_ENV=staging
+      - SLATE_DATA_DIR=/data
+      - SLATE_DOORBELL_RTSP_URL=rtsp://mediamtx:8554/doorbell
+      - SLATE_DOORBELL_WHEP_URL=http://mediamtx:8889/doorbell/whep
+      # Deliberately NOT SLATE_STUB_INTEGRATIONS=true right now (temporary,
+      # dated 2026-08-14, see infra/README.md's "Staging: temporarily real
+      # integrations" section) - staging is validating this session's batch
+      # of un-promoted fixes against real Hue/Cast devices before promotion.
+      # Revert to stubbed by uncommenting the line below.
+      # - SLATE_STUB_INTEGRATIONS=true
+    # Same env_file as `server`/`caddy` below - without this, SLATE_ADMIN_PASSWORD
+    # in .env never reaches this container, and every login attempt fails
+    # closed with no visible error (missed when this was added in issue 0.9;
+    # found via a real deploy to the staging host).
+    env_file:
+      - path: .env
+        required: false
+    profiles:
+      - staging
+
+  # Doorbell video fan-out (backlog 5.8 Phase 2, spec 3.17). The Eufy
+  # FamiLock S3 gives the server ONE H.265 P2P stream; six wall tablets want
+  # to watch it. `server` runs a single ffmpeg transcode (H.265 -> H.264,
+  # which WebRTC requires and this device cannot produce itself) and publishes
+  # it here over RTSP; this sidecar does the 1-to-N, so the transcode cost is
+  # paid once no matter how many tablets look.
+  #
+  # Off-the-shelf rather than built here on purpose: 1-to-N WebRTC fan-out is
+  # solved software, and the server deliberately does NOT become a WebRTC
+  # media peer for this leg.
+  #
+  # Tablets never address this container. They POST their SDP to Slate, which
+  # proxies the WHEP exchange (server/src/eufy/doorbell/whep.ts) - one origin,
+  # one device-token check, and no second service needing its own auth. The
+  # media itself still flows straight from here to the tablet over ICE.
+  #
+  # Configured entirely by MTX_* env vars so no host has to fetch a config
+  # file - the same "every host only needs two files" rule as the rest of this
+  # stack. Everything not needed is switched off rather than left listening.
+  #
+  # NOTE: on the compose bridge network, WebRTC needs candidates the tablets
+  # can actually reach, which container IPs are not - set SLATE_HOST_LAN_IP in
+  # the host's .env. On host networking (infra/docker-compose.host-network.yml,
+  # the supported deployment) that is unnecessary and the variable is ignored.
+  mediamtx:
+    image: bluenviron/mediamtx:1.11.3
+    container_name: slate-mediamtx
+    restart: unless-stopped
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
+    ports:
+      # WebRTC/WHEP signalling and the ICE mux, LAN only (see the note at the
+      # top of this file). RTSP (8554) is deliberately NOT published: only the
+      # `server` container publishes to it, over the compose network.
+      - "8889:8889"
+      - "8189:8189/udp"
+      - "8189:8189/tcp"
+    environment:
+      - MTX_LOGLEVEL=warn
+      - MTX_API=no
+      - MTX_METRICS=no
+      - MTX_PPROF=no
+      - MTX_PLAYBACK=no
+      - MTX_RTMP=no
+      - MTX_HLS=no
+      - MTX_SRT=no
+      - MTX_RTSPTRANSPORTS=tcp
+      - MTX_WEBRTCADDITIONALHOSTS=${SLATE_HOST_LAN_IP:-}
+      # One path, publisher-fed. Nothing else may be published here.
+      - MTX_PATHS_DOORBELL_SOURCE=publisher
+
+  # Reverse proxy / TLS termination (issue 0.9, spec 5.1): DNS-01 via
+  # Cloudflare, one instance per host - an additional HTTPS front door
+  # alongside `server`'s existing direct :8080 HTTP access, not a
+  # replacement for it. CLOUDFLARE_API_TOKEN/SLATE_HOSTNAME/SLATE_UPSTREAM
+  # are container-level secrets Caddy needs on its own - it can't call into
+  # the Slate admin API for its own TLS credentials the way the Node
+  # server's settings (0.8) work - so they come from the same host-local
+  # `.env`, not from Slate's own config DB. Pulls a published image (issue
+  # 0.11), built/pushed by CI's publish-caddy job - no local build needed
+  # on any host.
+  # PINNED TO :production, NOT :latest, AND THAT IS THE WHOLE POINT.
+  #
+  # This container is the TLS front door. On `:latest` with the Watchtower
+  # label below, it moved the moment anything landed on main that rebuilt the
+  # image - no promotion gate at all, while the server beside it had one. It
+  # took this house down on 2026-09-09.
+  #
+  # Since this compose file is what a CUSTOMER fetches and runs, an ungated
+  # tag here would put an unreviewed proxy in front of every install we sell.
+  # `:production` is moved by .github/workflows/promote-caddy.yml, which a
+  # server promotion also calls.
+  caddy:
+    image: ghcr.io/dfalpha/slate-caddy:production
+    container_name: slate-caddy
+    restart: unless-stopped
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
+    # No depends_on: [server] - Caddy doesn't need it (reverse_proxy just
+    # 502s until the upstream is reachable, standard behavior) and the
+    # dependency previously forced a pull of the private `server` image as
+    # a side effect of starting `caddy` alone, which fails on a host that
+    # hasn't authenticated to GHCR for it (found deploying to staging).
+    ports:
+      - "443:443"      # HTTPS (LAN only, see the note at the top of this file)
+    volumes:
+      # Caddy's own state. It no longer issues anything -- the portal does --
+      # so this holds far less than it used to, but it is kept rather than
+      # dropped: removing a volume that may still contain an old ACME account
+      # is a separate, deliberate decision from changing where certificates
+      # come from.
+      - slate-caddy-data:/data
+      - slate-caddy-config:/config
+      # THE SERVER'S DATA DIRECTORY, READ-ONLY, and `:ro` is not decoration.
+      #
+      # The server writes its certificate and private key under /data/tls after
+      # each check-in; Caddy reads them. Read-only because Caddy has no reason
+      # to write anything of Slate's, and because a reverse proxy that can
+      # rewrite the private key it serves is a strictly worse thing to have on
+      # a network than one that cannot.
+      - slate-data:/srv/slate:ro
+    env_file:
+      - path: .env
+        required: false
+
+  # Pull-based updater: polls ghcr.io and restarts labeled containers on a
+  # new image (issue 0.4). Same plain interval-polling behavior on every
+  # host - production's deliberateness comes entirely from `server` tracking
+  # a manually-promoted :production tag above, not from Watchtower itself
+  # doing anything different there (issue 0.11 revision - an earlier version
+  # of this used Watchtower's HTTP-API trigger mode instead; dropped in
+  # favor of this simpler, lower-surface design). Label-scoped, so it only
+  # ever touches server/server-staging/caddy, never anything else running
+  # on the host. Registry auth comes from the host's own `docker login`
+  # (see ../infra/README.md); no credentials live in this repo.
+  #
+  # WATCHTOWER_POLL_INTERVAL is host-tunable via .env (compose's own ${VAR}
+  # substitution, reading the project-root .env directly - distinct from
+  # the env_file: mechanism used above) - see infra/README.md for
+  # recommended per-host values.
+  watchtower:
+    image: nickfedor/watchtower
+    container_name: slate-watchtower
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${HOME}/.docker:/config:ro
+    environment:
+      - DOCKER_CONFIG=/config
+      - WATCHTOWER_LABEL_ENABLE=true
+      - WATCHTOWER_CLEANUP=true
+      - WATCHTOWER_POLL_INTERVAL=${WATCHTOWER_POLL_INTERVAL:-300}
+
+volumes:
+  slate-data:
+  slate-data-staging:
+  slate-caddy-data:
+  slate-caddy-config:
