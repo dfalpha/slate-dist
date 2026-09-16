@@ -141,10 +141,10 @@ What it does:
   5. Starts an Ubuntu 24.04 VM named "slate" (vz, bridged, 4 CPU / 8 GB /
      128 GB by default).
   6. Runs the Linux installer inside it - which installs Docker, pulls the
-     public images, asks for the .env values, starts the stack and VERIFIES
-     host networking from inside the VM.
-  7. Prints the admin panel's address and how to link the server to your
-     Slate account.
+     public images, writes .env without asking anything, starts the stack and
+     VERIFIES host networking from inside the VM.
+  7. Opens Slate's single-use first-setup page in your browser, where you
+     create the administrator and link the server to your Slate account.
 
 Re-running is safe: Lima, socket_vmnet, the network config and the VM are all
 detected and reused.
@@ -460,16 +460,69 @@ verify_vm_on_lan() {
 }
 
 # The Linux installer, unchanged, inside the VM. Downloaded to a file first
-# rather than `curl | sh`, so its prompts have a clean stdin.
+# rather than `curl | sh`, so any prompt (only the transitional GitHub-token
+# fallback is left) has a clean stdin.
+#
+# SLATE_FIRST_SETUP=none: the VM is headless, and the link it would print
+# carries the VM's view of things. This script asks for the link itself at the
+# end and opens it in the Mac's own browser (show_first_setup).
 run_linux_installer() {
     step "Running the Linux installer inside the VM"
     inner="curl -fsSL -o /tmp/slate-install.sh $SLATE_DIST_RAW/slate-install.sh && sh /tmp/slate-install.sh"
     if [ "$DRY_RUN" -eq 1 ]; then
-        info "[dry-run] limactl shell $VM_NAME -- sudo sh -c \"$inner\""
+        info "[dry-run] limactl shell $VM_NAME -- sudo env SLATE_FIRST_SETUP=none sh -c \"$inner\""
         return 0
     fi
-    limactl shell "$VM_NAME" -- sudo sh -c "$inner" ||
+    limactl shell "$VM_NAME" -- sudo env SLATE_FIRST_SETUP=none sh -c "$inner" ||
         die "The Linux installer failed inside the VM. Its own message above says why; re-run this script once it is fixed - everything up to here is reused."
+}
+
+# Prints (or with --new, rotates) the server's single-use first-setup link,
+# run inside the VM. The server mints the token on its first start with no
+# administrator; this only reads it out.
+SETUP_URL_COMMAND="docker exec slate-server node dist/cli/firstSetupUrl.js"
+
+# D12, 2026-09-15: "Browser opens; the setup wizard creates the admin.
+# Installers ask nothing." Reads the link out of the server in the VM and opens
+# it in this Mac's browser. The VM is bridged, so the Mac reaches it on its own
+# LAN address; with no address found, localhost is the fallback (Lima forwards
+# the guest's listening ports to it).
+show_first_setup() {
+    if [ "$DRY_RUN" -eq 1 ]; then
+        info "[dry-run] would ask the server in the VM for its single-use first-setup link"
+        info "[dry-run] (limactl shell $VM_NAME -- sudo $SETUP_URL_COMMAND) and open it with 'open'."
+        return 0
+    fi
+    setup_host="${VM_LAN_IP:-localhost}"
+    # Word splitting of SETUP_URL_COMMAND is intended: it is a command line.
+    # shellcheck disable=SC2086
+    if setup_url=$(limactl shell "$VM_NAME" -- sudo $SETUP_URL_COMMAND --host "$setup_host" 2>/dev/null); then
+        setup_url=$(printf '%s\n' "$setup_url" | head -n 1)
+    else
+        setup_rc=$?
+        setup_url=""
+        if [ "$setup_rc" -eq 3 ]; then
+            log "This server already has an administrator: sign in with that account."
+            return 0
+        fi
+    fi
+    case "$setup_url" in
+        http://*"/admin/setup?t="*)
+            log "Finish setting up in your browser: create the administrator, then link"
+            log "this server to your Slate account. Opening:"
+            log "  $setup_url"
+            log "The link works once and expires after 24 hours. For a fresh one:"
+            log "  limactl shell $VM_NAME -- sudo $SETUP_URL_COMMAND --new"
+            if have open; then
+                open "$setup_url" >/dev/null 2>&1 || warn "Could not open a browser; open the link above by hand."
+            fi
+            ;;
+        *)
+            log "Finish setting up in a browser. Print the single-use setup link with:"
+            log "  limactl shell $VM_NAME -- sudo $SETUP_URL_COMMAND"
+            ;;
+    esac
+    setup_url=""
 }
 
 finish() {
@@ -487,7 +540,10 @@ finish() {
         log "  http://<the VM's LAN address>:8080/admin   (the Linux installer printed it)"
     fi
     printf '\n'
-    log "Connect this server to your Slate account:"
+    show_first_setup
+    printf '\n'
+    log "Connect this server to your Slate account in the setup page's second"
+    log "step. To do it later instead, sign in to the admin panel and"
     log "  open the Licence tab, click Link to my Slate account, and type the"
     log "  code at $SLATE_PORTAL_LINK_URL"
     printf '\n'

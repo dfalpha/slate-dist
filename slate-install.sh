@@ -7,13 +7,13 @@
 # images, writes a host-local .env, brings the stack up, and then VERIFIES that
 # the containers really are on the host's own network before declaring success.
 #
-# IT ASKS FOR ONE THING: the admin panel's password. Everything else in
-# .env.example is either legitimately empty, ships a correct default, or has
-# one this script knows better (env_installer_default) - so there is nothing
-# for a customer to decide and nothing for them to get wrong. Set
-# SLATE_ADMIN_PASSWORD in the environment and it asks for nothing at all,
-# which is the path the Windows installer takes (its wizard collects it and
-# forwards it into the distro through WSLENV).
+# IT ASKS NOTHING. Every value in .env.example is either legitimately empty,
+# ships a correct default, or has one this script knows better
+# (env_installer_default) - so there is nothing for a customer to decide and
+# nothing for them to get wrong. Owner, 2026-09-15 (D12): "Browser opens; the
+# setup wizard creates the admin. Installers ask nothing." So the last thing
+# this script does is hand over the server's single-use first-setup link -
+# printed always, and opened in a browser when there is a desktop session.
 #
 # No credential is needed. The images are public packages on ghcr.io and the
 # files come from https://github.com/dfalpha/slate-dist, a public mirror of
@@ -62,6 +62,20 @@ SLATE_PORTAL_LINK_URL="https://portal.slatepanel.app/account/link"
 # named ones, and forgetting mediamtx is exactly how doorbell video ran broken
 # on every host for weeks (infra/README.md, 2026-08-28).
 COMPOSE_SERVICES="server caddy watchtower mediamtx"
+
+# The host-shell command that prints (or with --new, rotates) the server's
+# single-use first-setup link. The server mints the token itself on its first
+# start with no administrator (server/src/auth/firstSetup.ts); this only reads
+# it out, and it is the documented way to get a fresh one later.
+SETUP_URL_COMMAND="docker exec slate-server node dist/cli/firstSetupUrl.js"
+
+# What to do with that link at the end:
+#   auto   print it, and open it in a browser when a desktop session exists
+#   print  print it, never open a browser
+#   none   say nothing about it - for a wrapper that fetches and opens the link
+#          itself (the Windows and macOS installers), so it is never printed
+#          into a log or on a screen that is not the one being looked at
+SLATE_FIRST_SETUP="${SLATE_FIRST_SETUP:-auto}"
 
 INSTALL_DIR="${SLATE_INSTALL_DIR:-/opt/slate}"
 DRY_RUN=0
@@ -149,9 +163,9 @@ Options:
   -h, --help           This text.
 
 Environment (all optional):
-  SLATE_ADMIN_PASSWORD The password for the admin panel's `admin` account. Set
-                       it and the installer asks nothing at all; leave it unset
-                       and it is the one thing you are prompted for.
+  SLATE_FIRST_SETUP    What to do with the first-setup link at the end: auto
+                       (default: print it, and open a browser when there is a
+                       desktop session), print (never open), or none.
   SLATE_INSTALL_DIR    Same as --install-dir.
   SLATE_DIST_RAW       Base URL of the public dist mirror (for testing).
   SLATE_GHCR_USER      Only for the fallback below: GitHub username.
@@ -170,15 +184,18 @@ What it does:
   2. Installs Docker Engine + the compose plugin (apt or dnf) if absent.
   3. Fetches docker-compose.yml, infra/docker-compose.host-network.yml and
      .env.example from the dist mirror, anonymously.
-  4. Asks for the admin panel password - the only thing it asks - and writes
-     <install-dir>/.env, using .env.example as the source of truth for which
-     variables exist. Mode 0600, never inside a checkout.
+  4. Writes <install-dir>/.env without asking anything, using .env.example as
+     the source of truth for which variables exist. Mode 0600, never inside a
+     checkout.
   5. Pulls the public images and brings the stack up with host networking.
   6. VERIFIES host networking - container network namespace vs the host's,
      plus an mDNS sanity probe - and fails loudly with the reason if it is
      not what the stack needs.
-  7. Prints the admin panel's address and how to link this server to your
-     Slate account.
+  7. Prints the single-use first-setup link - and opens it in a browser when
+     there is a desktop session - where you create the administrator and link
+     this server to your Slate account. The link works once and expires after
+     24 hours; print a fresh one with:
+       sudo docker exec slate-server node dist/cli/firstSetupUrl.js --new
 
 Re-running is safe: an existing Docker install, .env and running stack are
 all detected and reused.
@@ -585,8 +602,8 @@ fetch_stack_files() {
     fi
 }
 
-# The .env this writes holds a Cloudflare token and the admin password. It
-# must never land inside a git working tree, where a stray `git add -A` could
+# The .env this writes can hold secrets (an optional recovery password, keys
+# added later). It must never land inside a git working tree, where a stray `git add -A` could
 # commit it.
 guard_not_a_checkout() {
     guard_dir="$INSTALL_DIR"
@@ -645,65 +662,9 @@ env_resolved_value() {
     printf '%s' "$resolved"
 }
 
-# The admin panel enforces 8 characters on every password it sets itself
-# (server/src/adminApi.ts), so accepting a shorter one here would hand the
-# customer a password the panel would then refuse to let them keep.
-ADMIN_PASSWORD_MIN=8
-ADMIN_PASSWORD=""
-
-# The ONE question this installer asks, and only when it has to. $1 is whatever
-# an existing .env already holds.
-#
-# Not asked at all when SLATE_ADMIN_PASSWORD is already in the environment -
-# that is how the Windows installer works (its wizard collects it and WSLENV
-# carries it into the distro) and how an unattended install works - or when a
-# previous run already wrote one.
-read_admin_password() {
-    if [ -n "${SLATE_ADMIN_PASSWORD:-}" ]; then
-        ADMIN_PASSWORD="$SLATE_ADMIN_PASSWORD"
-        info "Admin password: taken from SLATE_ADMIN_PASSWORD; nothing to ask."
-        return 0
-    fi
-    if [ -n "$1" ]; then
-        ADMIN_PASSWORD="$1"
-        info "Admin password: keeping the one already in .env."
-        return 0
-    fi
-    if [ "$PROMPT_IN" != /dev/tty ]; then
-        die "There is no terminal to ask for the admin password on, and no existing .env to take one from. Set SLATE_ADMIN_PASSWORD in the environment and re-run."
-    fi
-
-    printf '\n'
-    info "Choose the password for the Slate admin panel. It is the only thing"
-    info "this installer needs from you - everything else has a correct default."
-    info "The username is 'admin' and cannot be changed here."
-    info "At least $ADMIN_PASSWORD_MIN characters. Input is hidden."
-    while :; do
-        read_secret "Admin password"
-        admin_first="$PROMPT_RESULT"
-        PROMPT_RESULT=""
-        if [ "${#admin_first}" -lt "$ADMIN_PASSWORD_MIN" ]; then
-            printf '  Too short - at least %s characters. Try again.\n' \
-                "$ADMIN_PASSWORD_MIN" >&2
-            admin_first=""
-            continue
-        fi
-        read_secret "Confirm password"
-        admin_second="$PROMPT_RESULT"
-        PROMPT_RESULT=""
-        if [ "$admin_first" != "$admin_second" ]; then
-            printf '  Those do not match. Try again.\n' >&2
-            admin_first=""
-            admin_second=""
-            continue
-        fi
-        ADMIN_PASSWORD="$admin_first"
-        admin_first=""
-        admin_second=""
-        break
-    done
-}
-
+# Nothing in here asks a question. The first administrator is not an
+# installer setting at all any more: the server has none until somebody opens
+# the first-setup link at the end of this script and creates one (D12).
 write_env() {
     step "Configuration ($INSTALL_DIR/.env)"
 
@@ -711,12 +672,8 @@ write_env() {
         info "[dry-run] would write $INSTALL_DIR/.env (mode 0600) with every"
         info "[dry-run] variable in .env.example, taking each value from an"
         info "[dry-run] existing .env, then this installer's own defaults, then"
-        info "[dry-run] .env.example's."
-        if [ -n "${SLATE_ADMIN_PASSWORD:-}" ]; then
-            info "[dry-run] SLATE_ADMIN_PASSWORD is already set, so it would ask nothing."
-        else
-            info "[dry-run] the admin panel's password is the only thing it would ask for."
-        fi
+        info "[dry-run] .env.example's. It asks nothing: the administrator is"
+        info "[dry-run] created in the browser afterwards."
         return 0
     fi
 
@@ -729,27 +686,16 @@ write_env() {
         info "An existing .env was found - every value already in it is kept."
     fi
 
-    # Asked before a line is written, so the question is the first thing on
-    # screen rather than something that interrupts a list of settings.
-    if env_example_vars "$example_file" | grep -qx 'SLATE_ADMIN_PASSWORD'; then
-        read_admin_password "$(env_current_value "$env_file" SLATE_ADMIN_PASSWORD)"
-    fi
-
     umask 077
     : > "$tmp_file"
-    printf '# Generated by slate-install.sh. Host-local; contains secrets.\n' >> "$tmp_file"
+    printf '# Generated by slate-install.sh. Host-local; may contain secrets.\n' >> "$tmp_file"
     printf '# Regenerate by re-running the installer.\n\n' >> "$tmp_file"
 
     for var in $(env_example_vars "$example_file"); do
-        if [ "$var" = SLATE_ADMIN_PASSWORD ]; then
-            value="$ADMIN_PASSWORD"
-        else
-            value=$(env_resolved_value "$var" "$env_file" "$example_file")
-        fi
+        value=$(env_resolved_value "$var" "$env_file" "$example_file")
         printf '%s=%s\n' "$var" "$value" >> "$tmp_file"
     done
     value=""
-    ADMIN_PASSWORD=""
 
     mv "$tmp_file" "$env_file"
     chmod 600 "$env_file"
@@ -972,6 +918,148 @@ wait_for_server() {
     warn "The server did not answer http://localhost:8080/health within 60s. It may still be starting; check 'docker logs slate-server'."
 }
 
+# ------------------------------------------------------------- first setup
+
+FIRST_SETUP_URL=""
+FIRST_SETUP_STATE=""
+
+# Reads the first-setup link out of the running server. $1 is the host to put
+# in it. Sets FIRST_SETUP_STATE to:
+#   url           FIRST_SETUP_URL holds the link;
+#   admin-exists  the command's exit 3 - an existing install that already has
+#                 an administrator, so there is nothing to set up;
+#   unavailable   anything else (an older image without the command, a server
+#                 that is not up) - the caller prints how to get it by hand.
+read_first_setup_url() {
+    FIRST_SETUP_URL=""
+    FIRST_SETUP_STATE=unavailable
+    have docker || return 0
+    # Word splitting of SETUP_URL_COMMAND is intended: it is a command line.
+    # shellcheck disable=SC2086
+    if setup_out=$($SETUP_URL_COMMAND --host "$1" 2>/dev/null); then
+        FIRST_SETUP_URL=$(printf '%s\n' "$setup_out" | head -n 1)
+        case "$FIRST_SETUP_URL" in
+            http://*"/admin/setup?t="*) FIRST_SETUP_STATE=url ;;
+            *) FIRST_SETUP_URL="" ;;
+        esac
+    else
+        setup_rc=$?
+        if [ "$setup_rc" -eq 3 ]; then
+            FIRST_SETUP_STATE=admin-exists
+        fi
+    fi
+    setup_out=""
+}
+
+OPEN_USER=""
+OPEN_DISPLAY=""
+OPEN_WAYLAND=""
+OPEN_RUNTIME=""
+
+# True when there is a graphical session to open a browser in. This script
+# runs as root, normally through sudo, and root has no desktop - so it looks
+# for the session of the user who ran sudo. A headless server has neither a
+# display variable nor a Wayland or X socket, and gets the link printed only.
+#
+# WSL is excluded on purpose: there the Windows installer opens the browser on
+# Windows, and a Linux browser appearing through WSLg would be a second one.
+find_desktop_session() {
+    if is_wsl || ! have xdg-open; then
+        return 1
+    fi
+    OPEN_USER=""
+    OPEN_DISPLAY="${DISPLAY:-}"
+    OPEN_WAYLAND="${WAYLAND_DISPLAY:-}"
+    OPEN_RUNTIME="${XDG_RUNTIME_DIR:-}"
+    if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != root ]; then
+        have sudo || return 1
+        open_uid=$(id -u "$SUDO_USER" 2>/dev/null || printf '')
+        [ -n "$open_uid" ] || return 1
+        OPEN_USER="$SUDO_USER"
+        OPEN_RUNTIME="/run/user/$open_uid"
+        if [ -z "$OPEN_WAYLAND" ] && [ -S "$OPEN_RUNTIME/wayland-0" ]; then
+            OPEN_WAYLAND=wayland-0
+        fi
+        if [ -z "$OPEN_DISPLAY" ] && [ -S /tmp/.X11-unix/X0 ]; then
+            OPEN_DISPLAY=:0
+        fi
+    fi
+    [ -n "$OPEN_DISPLAY" ] || [ -n "$OPEN_WAYLAND" ]
+}
+
+# As the desktop user, in the background, output discarded: a browser that
+# will not start must not fail an install that has already succeeded, and the
+# link is on screen either way. Call find_desktop_session first.
+open_in_browser() {
+    open_url="$1"
+    set -- env
+    if [ -n "$OPEN_DISPLAY" ]; then set -- "$@" "DISPLAY=$OPEN_DISPLAY"; fi
+    if [ -n "$OPEN_WAYLAND" ]; then set -- "$@" "WAYLAND_DISPLAY=$OPEN_WAYLAND"; fi
+    if [ -n "$OPEN_RUNTIME" ]; then
+        set -- "$@" "XDG_RUNTIME_DIR=$OPEN_RUNTIME"
+        if [ -S "$OPEN_RUNTIME/bus" ]; then
+            set -- "$@" "DBUS_SESSION_BUS_ADDRESS=unix:path=$OPEN_RUNTIME/bus"
+        fi
+    fi
+    if [ -n "$OPEN_USER" ]; then
+        set -- sudo -u "$OPEN_USER" "$@"
+    fi
+    "$@" xdg-open "$open_url" >/dev/null 2>&1 &
+    open_url=""
+}
+
+# D12, 2026-09-15: "Browser opens; the setup wizard creates the admin.
+# Installers ask nothing." The server minted a single-use token on its first
+# start with no administrator; this reads the link out and hands it over.
+# $1 is this host's LAN address, which is what a link printed for use from
+# another machine has to carry.
+show_first_setup() {
+    setup_mode="$SLATE_FIRST_SETUP"
+    case "$setup_mode" in
+        auto|print|none) ;;
+        *)
+            warn "SLATE_FIRST_SETUP='$setup_mode' is not auto, print or none; using auto."
+            setup_mode=auto
+            ;;
+    esac
+    if [ "$setup_mode" = none ]; then
+        return 0
+    fi
+
+    if [ "$DRY_RUN" -eq 1 ]; then
+        info "[dry-run] would print the single-use first-setup link ($SETUP_URL_COMMAND)"
+        if [ "$setup_mode" = auto ] && find_desktop_session; then
+            info "[dry-run] and open it in a browser: a desktop session is present."
+        else
+            info "[dry-run] and open no browser: no desktop session here, or SLATE_FIRST_SETUP=print."
+        fi
+        return 0
+    fi
+
+    read_first_setup_url "${1:-localhost}"
+    case "$FIRST_SETUP_STATE" in
+        url)
+            log "Finish setting up in a browser: create the administrator, then link"
+            log "this server to your Slate account. Open:"
+            log "  $FIRST_SETUP_URL"
+            log "The link works once and expires after 24 hours. For a fresh one:"
+            log "  sudo $SETUP_URL_COMMAND --new"
+            if [ "$setup_mode" = auto ] && find_desktop_session; then
+                open_in_browser "$FIRST_SETUP_URL"
+                log "(Opening it in your browser now.)"
+            fi
+            ;;
+        admin-exists)
+            log "This server already has an administrator: sign in with that account."
+            ;;
+        *)
+            log "Finish setting up in a browser. Print the single-use setup link with:"
+            log "  sudo $SETUP_URL_COMMAND"
+            ;;
+    esac
+    FIRST_SETUP_URL=""
+}
+
 finish() {
     lan_ip=$(host_lan_ip)
     hostname_value=""
@@ -996,17 +1084,17 @@ finish() {
         log "  http://<this-host-lan-ip>:8080/admin"
     fi
     printf '\n'
-    log "Log in as 'admin' with the password you set during this install, then"
-    log "change it from the Users tab whenever you like. The stack lives in"
-    log "$INSTALL_DIR; re-running this installer is safe - it keeps every"
-    log "value already in .env and asks nothing."
+    show_first_setup "$lan_ip"
     printf '\n'
-    # The device-link code is minted by the server only when an admin starts a
-    # link, and it is read back through the authenticated admin API
-    # (GET /api/admin/licence/link) - there is no unauthenticated read of it,
-    # and this installer adds no server endpoint. So the last thing on screen
-    # is where the code appears and where it goes.
-    log "Connect this server to your Slate account:"
+    log "The stack lives in $INSTALL_DIR; re-running this installer is safe - it"
+    log "keeps every value already in .env and asks nothing."
+    printf '\n'
+    # The setup page's second step signs in to the Slate account. The
+    # device-link code stays the way to do it later: it is minted by the server
+    # only when an admin starts a link and read back through the authenticated
+    # admin API, so this names where it appears rather than printing one.
+    log "Connect this server to your Slate account in the setup page's second"
+    log "step. To do it later instead, sign in to the admin panel and"
     log "  open the Licence tab, click Link to my Slate account, and type the"
     log "  code at $SLATE_PORTAL_LINK_URL"
 

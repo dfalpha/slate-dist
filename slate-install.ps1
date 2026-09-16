@@ -25,7 +25,7 @@
                                    Hyper-V firewall rules, the port-collision
                                    check, creates the distro, verifies it.
       2. slate-install.sh          INSIDE the distro, as root: Docker Engine,
-                                   the public images, .env from prompts, the
+                                   the public images, .env with no prompts, the
                                    stack on host networking, and a VERIFIED
                                    host-network check.
       3. slate-keepalive-task.ps1  The scheduled task (S4U, this user, never
@@ -50,27 +50,36 @@
     Where the downloaded scripts live on Windows. NOT a user profile: the
     keepalive task must read wsl-keepalive.ps1 at boot with nobody logged on.
 
+.PARAMETER SetupUrlFile
+    Write the server's single-use first-setup link to this file instead of
+    printing it or opening a browser. SlateSetup.exe passes a file in its own
+    temporary directory: its run is under a transcript in ProgramData, and the
+    link must not land in a log.
+
+.PARAMETER NoBrowser
+    Print the first-setup link but do not open it.
+
 .NOTES
     Needs PowerShell 7 (New-NetFirewallHyperVRule does not exist in 5.1) and
     elevation. Both are checked first and explained, not assumed.
 
+    It asks nothing. Owner, 2026-09-15 (D12): "Browser opens; the setup wizard
+    creates the admin. Installers ask nothing." The server mints a single-use
+    first-setup token on its first start with no administrator; the last thing
+    this script does is ask it for the link and open it (Show-FirstSetup).
+
     SLATE_GHCR_USER / SLATE_GHCR_TOKEN, if set in this session, are passed into
     the distro (WSLENV) for the Linux installer's fallback when the images or
     the mirror are still private. Nothing here needs them otherwise.
-
-    SLATE_ADMIN_PASSWORD travels the same way. SlateSetup.exe collects it on a
-    wizard page and puts it in this process's environment; with it set, the
-    Linux installer asks nothing at all. Run from the bare one-liner instead,
-    it is simply unset and the Linux installer asks for it on the console. It
-    is never printed here and never appears on a command line - a command line
-    is readable by every user on the machine, an environment block is not.
 #>
 [CmdletBinding()]
 param(
     [switch]$DryRun,
     [string]$Distro      = 'Slate',
     [string]$DistBase    = 'https://raw.githubusercontent.com/dfalpha/slate-dist/main',
-    [string]$InstallRoot = ''
+    [string]$InstallRoot = '',
+    [string]$SetupUrlFile = '',
+    [switch]$NoBrowser
 )
 
 $ErrorActionPreference = 'Stop'
@@ -81,6 +90,9 @@ if (-not $InstallRoot) {
 }
 $InstallDir   = Join-Path $InstallRoot 'install'
 $PortalLink   = 'https://portal.slatepanel.app/account/link'
+# Run inside the distro: prints (or with --new, rotates) the server's
+# single-use first-setup link.
+$SetupUrlCommand = 'docker exec slate-server node dist/cli/firstSetupUrl.js'
 # Everything this run needs, refreshed from the mirror every time. The last
 # two are only USED by SlateSetup.exe, which registers the version-sync task -
 # but they are downloaded here so that changing them never means rebuilding
@@ -254,10 +266,11 @@ function Invoke-LinuxInstaller {
     $lin = 'sh "$(wslpath -u ' + "'$shPath'" + ')"'
     # Forwarded into the distro. WSLENV names variables to copy out of THIS
     # process's environment, so an unset one simply arrives empty: the GHCR
-    # pair is for the private-images fallback, and SLATE_ADMIN_PASSWORD is
-    # what SlateSetup.exe's wizard page collected. Empty means "not set" on
-    # the Linux side, which then asks for it on the console.
-    $env:WSLENV = 'SLATE_GHCR_USER:SLATE_GHCR_TOKEN:SLATE_DIST_RAW:SLATE_ADMIN_PASSWORD'
+    # pair is for the private-images fallback. SLATE_FIRST_SETUP=none tells the
+    # Linux installer to say nothing about the first-setup link - this script
+    # fetches it at the end and opens it on Windows (Show-FirstSetup).
+    $env:SLATE_FIRST_SETUP = 'none'
+    $env:WSLENV = 'SLATE_GHCR_USER:SLATE_GHCR_TOKEN:SLATE_DIST_RAW:SLATE_FIRST_SETUP'
     $ok = Invoke-Action "wsl -d $Distro -u root -e sh -c `"$lin`"" {
         & wsl.exe -d $Distro -u root -e sh -c $lin
     }
@@ -288,6 +301,77 @@ function Get-LanIp {
     } catch { return '' }
 }
 
+# Asks the server inside the distro for its first-setup link. State is 'url',
+# 'admin-exists' (the command's exit 3: nothing to set up) or 'unavailable'
+# (an older image without the command, or a server that is not up).
+function Get-FirstSetupUrl {
+    $result = @{ State = 'unavailable'; Url = '' }
+    if (-not $IsWindows) { return $result }
+    try {
+        $out = & wsl.exe -d $Distro -u root -e docker exec slate-server node dist/cli/firstSetupUrl.js --host localhost 2>$null
+        $code = $LASTEXITCODE
+    } catch { return $result }
+    $first = ([string]($out | Select-Object -First 1)).Trim()
+    if ($code -eq 0 -and $first -match '^http://\S+/admin/setup\?t=[A-Za-z0-9_-]+$') {
+        $result.State = 'url'
+        $result.Url = $first
+    } elseif ($code -eq 3) {
+        $result.State = 'admin-exists'
+    }
+    return $result
+}
+
+# D12, 2026-09-15: "Browser opens; the setup wizard creates the admin.
+# Installers ask nothing." Until somebody uses it, the link is a credential -
+# whoever opens it first chooses the admin password - so it goes to exactly one
+# place:
+#   -SetupUrlFile   SlateSetup.exe: that file and nowhere else. This run is
+#                   under a transcript in ProgramData, and a link in a log is a
+#                   link anybody who can read the log can use.
+#   (default)       the one-liner: printed, and opened in the browser.
+#   -NoBrowser      printed only.
+function Show-FirstSetup {
+    $command = "wsl -d $Distro -u root $SetupUrlCommand"
+    if ($DryRun) {
+        Say "[dry-run] would ask the server for its single-use first-setup link ($command)"
+        if ($SetupUrlFile) { Say "[dry-run] and write it to $SetupUrlFile for SlateSetup.exe to open" }
+        elseif (-not $NoBrowser) { Say "[dry-run] and open it in the browser" }
+        return
+    }
+    $setup = Get-FirstSetupUrl
+    switch ($setup.State) {
+        'url' {
+            if ($SetupUrlFile) {
+                try {
+                    [IO.File]::WriteAllText($SetupUrlFile, $setup.Url)
+                    Write-Host "Finish setting up in the browser: Setup opens Slate's setup page when it finishes."
+                } catch {
+                    Warn "Could not hand the setup link to Setup ($($_.Exception.Message)). Print it with: $command"
+                }
+            } else {
+                Write-Host "Finish setting up in a browser: create the administrator, then link this"
+                Write-Host "server to your Slate account. Open:"
+                Write-Host "  $($setup.Url)"
+                Write-Host "The link works once and expires after 24 hours. For a fresh one:"
+                Write-Host "  $command --new"
+                if (-not $NoBrowser) {
+                    # Through explorer.exe, so the browser starts as the
+                    # signed-in user instead of inheriting this elevated session.
+                    try { Start-Process -FilePath explorer.exe -ArgumentList $setup.Url } catch { }
+                }
+            }
+        }
+        'admin-exists' {
+            Write-Host "This server already has an administrator: sign in with that account."
+        }
+        default {
+            Write-Host "Finish setting up in a browser. Print the single-use setup link with:"
+            Write-Host "  $command"
+        }
+    }
+    $setup = $null
+}
+
 function Show-Finish {
     $ip = Get-LanIp
     Write-Host ""
@@ -300,16 +384,16 @@ function Show-Finish {
     Write-Host "Admin panel:"
     if ($ip) { Write-Host "  http://${ip}:8080/admin" } else { Write-Host "  http://<this-pc-lan-ip>:8080/admin" }
     Write-Host ""
-    Write-Host "Log in as 'admin' with the password you set during this install,"
-    Write-Host "then change it from the Users tab whenever you like. The stack lives at"
-    Write-Host "/opt/slate inside the distro ('wsl -d $Distro' opens a shell there);"
-    Write-Host "re-running this line is safe - it keeps every value already in .env."
+    Show-FirstSetup
     Write-Host ""
-    # The device-link code is minted by the server when an admin starts a link
-    # and is read back only through the authenticated admin API; there is no
-    # unauthenticated read and this installer adds no endpoint. So: where it
-    # appears, and where it goes.
-    Write-Host "Connect this server to your Slate account:"
+    Write-Host "The stack lives at /opt/slate inside the distro ('wsl -d $Distro' opens a"
+    Write-Host "shell there); re-running this line is safe - it keeps every value already in .env."
+    Write-Host ""
+    # The setup page's second step signs in to the Slate account. The
+    # device-link code stays the way to do it later: minted by the server when
+    # an admin starts a link, readable only through the authenticated admin API.
+    Write-Host "Connect this server to your Slate account in the setup page's second step."
+    Write-Host "To do it later instead, sign in to the admin panel and"
     Write-Host "  open the Licence tab, click Link to my Slate account, and type the"
     Write-Host "  code at $PortalLink"
     Write-Host ""
