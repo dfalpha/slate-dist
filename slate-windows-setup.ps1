@@ -183,7 +183,7 @@ New-SlateRule 'Slate-Matter'    'Slate: Matter'                         'UDP' @(
 New-SlateRule 'Slate-HTTP'      'Slate: Caddy HTTP/HTTPS'               'TCP' @('80','443')
 New-SlateRule 'Slate-HTTP3'     'Slate: Caddy HTTP/3'                   'UDP' @('443')
 New-SlateRule 'Slate-Server'    'Slate: server HTTP/WS/admin/viewer'    'TCP' @('8080')
-New-SlateRule 'Slate-Spotify'   'Slate: Spotify stream + librespot'     'TCP' @('8090','8091')
+New-SlateRule 'Slate-Spotify'   'Slate: Spotify stream + pairing'       'TCP' @('8090','47824')
 New-SlateRule 'Slate-MediaMTX'  'Slate: mediamtx WHEP/ICE'              'TCP' @('8889','8189')
 New-SlateRule 'Slate-MediaMTXU' 'Slate: mediamtx ICE'                   'UDP' @('8189')
 New-SlateRule 'Slate-Ephemeral' 'Slate: ephemeral UDP (ICE/HAP/Matter)' 'UDP' @('32768-60999')

@@ -40,12 +40,18 @@ services:
       # the other process on this host.
       - SLATE_DOORBELL_RTSP_URL=rtsp://127.0.0.1:8554/doorbell
       - SLATE_DOORBELL_WHEP_URL=http://127.0.0.1:8889/doorbell/whep
+      # `soloist` stays on the bridge network (see docker-compose.yml) and
+      # publishes its ports to loopback, which is this namespace.
+      - SLATE_SOLOIST_HOST=127.0.0.1
 
   server-staging:
     network_mode: host
     environment:
       - SLATE_DOORBELL_RTSP_URL=rtsp://127.0.0.1:8554/doorbell
       - SLATE_DOORBELL_WHEP_URL=http://127.0.0.1:8889/doorbell/whep
+      # `soloist` stays on the bridge network (see docker-compose.yml) and
+      # publishes its ports to loopback, which is this namespace.
+      - SLATE_SOLOIST_HOST=127.0.0.1
 
   mediamtx:
     network_mode: host

@@ -38,6 +38,9 @@ services:
       # names do not resolve at all. Setting both explicitly here means
       # neither mode depends on remembering which default applies.
       - SLATE_DOORBELL_RTSP_URL=rtsp://mediamtx:8554/doorbell
+      # The Spotify player sidecar (`soloist` below), by service name on this
+      # network; infra/docker-compose.host-network.yml points it at loopback.
+      - SLATE_SOLOIST_HOST=soloist
       - SLATE_DOORBELL_WHEP_URL=http://mediamtx:8889/doorbell/whep
     # Optional, host-local, git-ignored - the one value that still needs an
     # env var at all: SLATE_ADMIN_PASSWORD, for the very first login before
@@ -75,6 +78,9 @@ services:
       - NODE_ENV=staging
       - SLATE_DATA_DIR=/data
       - SLATE_DOORBELL_RTSP_URL=rtsp://mediamtx:8554/doorbell
+      # The Spotify player sidecar (`soloist` below), by service name on this
+      # network; infra/docker-compose.host-network.yml points it at loopback.
+      - SLATE_SOLOIST_HOST=soloist
       - SLATE_DOORBELL_WHEP_URL=http://mediamtx:8889/doorbell/whep
       # Deliberately NOT SLATE_STUB_INTEGRATIONS=true right now (temporary,
       # dated 2026-08-14, see infra/README.md's "Staging: temporarily real
@@ -208,6 +214,41 @@ services:
       - path: .env
         required: false
 
+  # Spotify's own player, Soloist, in a sidecar of its own. The image holds
+  # only a supervisor and PulseAudio - never Soloist itself, which Slate does
+  # not redistribute. Once an admin stores the household's own Soloist API
+  # key, the supervisor downloads Soloist from Spotify, keeps it updated (its
+  # builds expire after 90 days), and swaps in a new build while nothing is
+  # playing.
+  #
+  # DELIBERATELY NOT ON HOST NETWORKING, even where everything else is. A
+  # Spotify Connect device on the LAN can be picked - and taken over - from
+  # any phone in the house. On this bridge network it is invisible; the
+  # server reaches it on the loopback ports below, and only opens a pairing
+  # window onto the LAN when an admin asks (server/src/soloist/pairing.ts).
+  #
+  # Ports, all loopback-only: 47820 supervisor control, 47821 Soloist's own
+  # WebSocket, 47822 the audio (raw PCM), 47823 Soloist's pairing endpoint.
+  #
+  # `:production` is moved by .github/workflows/promote-soloist.yml, which a
+  # server promotion also calls. No depends_on, for the reason given on caddy.
+  soloist:
+    image: ghcr.io/dfalpha/slate-soloist:production
+    container_name: slate-soloist
+    restart: unless-stopped
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
+    ports:
+      - "127.0.0.1:47820:47820"
+      - "127.0.0.1:47821:47821"
+      - "127.0.0.1:47822:47822"
+      - "127.0.0.1:47823:47823"
+    volumes:
+      # The key, the downloaded Soloist build and its sign-in. Losing it means
+      # a re-download and a re-pair, not lost music - the server hands the key
+      # back at its next start.
+      - slate-soloist-data:/data
+
   # Pull-based updater: polls ghcr.io and restarts labeled containers on a
   # new image (issue 0.4). Same plain interval-polling behavior on every
   # host - production's deliberateness comes entirely from `server` tracking
@@ -241,3 +282,4 @@ volumes:
   slate-data-staging:
   slate-caddy-data:
   slate-caddy-config:
+  slate-soloist-data:

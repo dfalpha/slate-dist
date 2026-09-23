@@ -60,8 +60,9 @@ SLATE_PORTAL_LINK_URL="https://portal.slatepanel.app/account/link"
 # The stack, as infra/README.md documents it. mediamtx and watchtower must be
 # named explicitly: naming any service on the command line starts only the
 # named ones, and forgetting mediamtx is exactly how doorbell video ran broken
-# on every host for weeks (infra/README.md, 2026-08-28).
-COMPOSE_SERVICES="server caddy watchtower mediamtx"
+# on every host for weeks (infra/README.md, 2026-08-28). soloist is Spotify's
+# player (build PR 4): without it Spotify is simply off.
+COMPOSE_SERVICES="server caddy watchtower mediamtx soloist"
 
 # The host-shell command that prints (or with --new, rotates) the server's
 # single-use first-setup link. The server mints the token itself on its first
