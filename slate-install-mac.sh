@@ -141,7 +141,7 @@ What it does:
   5. Starts an Ubuntu 24.04 VM named "slate" (vz, bridged, 4 CPU / 8 GB /
      128 GB by default).
   6. Runs the Linux installer inside it - which installs Docker, pulls the
-     public images, writes .env without asking anything, starts the stack and
+     images (after you approve this Mac in the browser), writes .env, starts the stack and
      VERIFIES host networking from inside the VM.
   7. Opens Slate's single-use first-setup page in your browser, where you
      create the administrator and link the server to your Slate account.
@@ -459,21 +459,116 @@ verify_vm_on_lan() {
     fi
 }
 
+# ------------------------------------------------------- registry sign-in
+#
+# Owner, 2026-09-24: Slate's images are served from registry.slatepanel.app to
+# Slate accounts with a licence. The customer approves this Mac in the browser
+# (RFC 8628 device code, the flow the Licence tab uses). Done HERE, on the Mac,
+# because the browser is here - the VM is headless. The credential is handed to
+# the Linux installer inside the VM on its stdin (run_linux_installer), never
+# on a command line, and the portal password never reaches this script.
+
+SLATE_PORTAL="https://portal.slatepanel.app"
+SLATE_REGISTRY="registry.slatepanel.app"
+REGISTRY_USER="${SLATE_REGISTRY_USER:-}"
+REGISTRY_TOKEN="${SLATE_REGISTRY_TOKEN:-}"
+
+# $1 = the key=value body, $2 = the key.
+kv() {
+    printf '%s\n' "$1" | sed -n "s/^$2=//p" | head -n 1
+}
+
+# POST a small JSON body from stdin; prints the body whatever the status.
+portal_post() {
+    curl -sS --max-time 30 -X POST -H 'Accept: text/plain' -H 'Content-Type: application/json' \
+        --data-binary @- "$SLATE_PORTAL$1"
+}
+
+vm_signed_in() {
+    limactl shell "$VM_NAME" -- sudo sh -c "grep -q '$SLATE_REGISTRY' /root/.docker/config.json" >/dev/null 2>&1
+}
+
+registry_sign_in() {
+    step "Approve this Mac with your Slate account ($SLATE_REGISTRY)"
+    if [ -n "$REGISTRY_USER" ] && [ -n "$REGISTRY_TOKEN" ]; then
+        info "A registry credential was supplied; using it."
+        return 0
+    fi
+    if [ "$DRY_RUN" -eq 1 ]; then
+        info "[dry-run] would show a code and $SLATE_PORTAL/account/authorize-install, open it"
+        info "[dry-run] in the browser, wait for approval, and hand the credential to the VM."
+        return 0
+    fi
+    if vm_signed_in; then
+        info "The VM is already signed in to $SLATE_REGISTRY."
+        return 0
+    fi
+    started=$(printf '{"os":"mac"}' | portal_post /registry/device/code) ||
+        die "Could not reach $SLATE_PORTAL to sign in. Check this Mac can reach the internet, then re-run."
+    device_code=$(kv "$started" device_code)
+    user_code=$(kv "$started" user_code)
+    interval=$(kv "$started" interval)
+    expires_in=$(kv "$started" expires_in)
+    [ -n "$device_code" ] && [ -n "$user_code" ] ||
+        die "The Slate portal did not start a sign-in ($(kv "$started" error)). Try again in a minute."
+    case "$interval" in ''|*[!0-9]*) interval=5 ;; esac
+    case "$expires_in" in ''|*[!0-9]*) expires_in=600 ;; esac
+
+    printf '\n'
+    log "To download Slate, approve this Mac with your Slate account:"
+    log "  1. Open   $(kv "$started" verification_uri)"
+    log "  2. Enter  $user_code"
+    log "Sign in with the account that holds your Slate licence. The code lasts ten"
+    log "minutes; this installer carries on by itself once you approve."
+    open "$(kv "$started" verification_uri_complete)" >/dev/null 2>&1 || true
+
+    waited=0
+    while [ "$waited" -lt "$expires_in" ]; do
+        sleep "$interval"
+        waited=$((waited + interval))
+        polled=$(printf '{"device_code":"%s"}' "$device_code" | portal_post /registry/device/token) || continue
+        REGISTRY_USER=$(kv "$polled" username)
+        REGISTRY_TOKEN=$(kv "$polled" password)
+        if [ -n "$REGISTRY_USER" ] && [ -n "$REGISTRY_TOKEN" ]; then
+            device_code=""
+            polled=""
+            info "Approved."
+            return 0
+        fi
+        case "$(kv "$polled" error)" in
+            authorization_pending) ;;
+            slow_down) interval=$((interval + 5)) ;;
+            access_denied)
+                die "The sign-in was refused, or the Slate account has no active licence. Start a trial or buy a licence at $SLATE_PORTAL, then re-run." ;;
+            expired_token)
+                die "The code expired before it was approved. Re-run the installer for a new one." ;;
+            *) ;;
+        esac
+    done
+    die "The code expired before it was approved. Re-run the installer for a new one."
+}
+
 # The Linux installer, unchanged, inside the VM. Downloaded to a file first
-# rather than `curl | sh`, so any prompt (only the transitional GitHub-token
-# fallback is left) has a clean stdin.
+# rather than `curl | sh`.
 #
 # SLATE_FIRST_SETUP=none: the VM is headless, and the link it would print
 # carries the VM's view of things. This script asks for the link itself at the
 # end and opens it in the Mac's own browser (show_first_setup).
+#
+# The registry credential, when this run collected one, goes in on STDIN and
+# into the installer's environment inside the VM - never onto a command line,
+# where the VM's process list would show it. Empty lines when the VM was
+# already signed in; the Linux installer then uses its stored credential.
 run_linux_installer() {
     step "Running the Linux installer inside the VM"
     inner="curl -fsSL -o /tmp/slate-install.sh $SLATE_DIST_RAW/slate-install.sh && sh /tmp/slate-install.sh"
     if [ "$DRY_RUN" -eq 1 ]; then
-        info "[dry-run] limactl shell $VM_NAME -- sudo env SLATE_FIRST_SETUP=none sh -c \"$inner\""
+        info "[dry-run] limactl shell $VM_NAME -- sudo sh -c '<credential on stdin>; SLATE_FIRST_SETUP=none $inner'"
         return 0
     fi
-    limactl shell "$VM_NAME" -- sudo env SLATE_FIRST_SETUP=none sh -c "$inner" ||
+    # shellcheck disable=SC2016 # $u and $t expand inside the VM, on purpose.
+    printf '%s\n%s\n' "$REGISTRY_USER" "$REGISTRY_TOKEN" |
+        limactl shell "$VM_NAME" -- sudo sh -c 'read -r u; read -r t; export SLATE_REGISTRY_USER="$u" SLATE_REGISTRY_TOKEN="$t" SLATE_FIRST_SETUP=none SLATE_INSTALLER_OS=mac; '"$inner" ||
         die "The Linux installer failed inside the VM. Its own message above says why; re-run this script once it is fixed - everything up to here is reused."
 }
 
@@ -578,5 +673,6 @@ ensure_sudoers
 ensure_vm
 ensure_start_at_login
 verify_vm_on_lan
+registry_sign_in
 run_linux_installer
 finish

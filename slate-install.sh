@@ -3,8 +3,9 @@
 # Slate server installer (Linux).
 #
 # Installs Docker Engine + the compose plugin if missing, fetches the two
-# compose files this stack needs from the public dist mirror, pulls the public
-# images, writes a host-local .env, brings the stack up, and then VERIFIES that
+# compose files this stack needs from the public dist mirror, signs this
+# machine in to Slate's registry and pulls the images, writes a host-local
+# .env, brings the stack up, and then VERIFIES that
 # the containers really are on the host's own network before declaring success.
 #
 # IT ASKS NOTHING. Every value in .env.example is either legitimately empty,
@@ -15,15 +16,17 @@
 # this script does is hand over the server's single-use first-setup link -
 # printed always, and opened in a browser when there is a desktop session.
 #
-# No credential is needed. The images are public packages on ghcr.io and the
-# files come from https://github.com/dfalpha/slate-dist, a public mirror of
-# exactly what an install fetches (never the source). If either turns out to
-# still be private - the owner has not flipped the switch yet - the script says
-# so in one sentence and offers the old GitHub-token path instead of failing.
+# THE ONE INTERACTION IS A BROWSER APPROVAL (owner, 2026-09-24). The images
+# are served from registry.slatepanel.app to Slate accounts with a licence, so
+# the installer shows a code and a link, the customer approves this machine
+# while signed in to their account, and the installer carries on - it never
+# reads a keystroke and never sees the portal password. See registry_sign_in.
+# The files come from https://github.com/dfalpha/slate-dist, a public mirror
+# of exactly what an install fetches (never the source), with no credential.
 #
 # Runs from a pipe: `curl -fsSL https://get.slatepanel.app/linux | sudo sh`.
-# Every prompt therefore reads /dev/tty, never stdin - under `curl | sh`, stdin
-# IS the script, and a `read` from it would eat the next line of this file.
+# Nothing reads stdin - under `curl | sh`, stdin IS the script, and a `read`
+# from it would eat the next line of this file.
 #
 # Why that last part is not optional: five subsystems depend on real LAN
 # presence - Cast discovery, Ecobee's HomeKit (HAP) pairing, Hue discovery and
@@ -48,11 +51,13 @@ set -eu
 SLATE_DIST_RAW_DEFAULT="https://raw.githubusercontent.com/dfalpha/slate-dist/main"
 SLATE_DIST_RAW="${SLATE_DIST_RAW:-$SLATE_DIST_RAW_DEFAULT}"
 
-# The fallback, used only if the mirror answers 404 (not created or not public
-# yet): the same three files, at the same paths, in the private source repo,
-# fetched with a GitHub token exactly as this script always used to.
-SLATE_REPO_RAW_DEFAULT="https://raw.githubusercontent.com/dfalpha/slate/main"
-SLATE_REPO_RAW="${SLATE_REPO_RAW:-$SLATE_REPO_RAW_DEFAULT}"
+# Where the images come from (owner decision 2026-09-24): Slate's own
+# registry, not public packages. Pulling needs a Slate account with a licence,
+# so the installer signs the customer in through the browser first - the
+# device-code flow in registry_sign_in below - and keeps the per-install
+# credential it is given in root's docker config, where Watchtower reads it.
+SLATE_REGISTRY="registry.slatepanel.app"
+SLATE_PORTAL="https://portal.slatepanel.app"
 
 # Where the customer types the code the Licence tab shows.
 SLATE_PORTAL_LINK_URL="https://portal.slatepanel.app/account/link"
@@ -82,29 +87,14 @@ INSTALL_DIR="${SLATE_INSTALL_DIR:-/opt/slate}"
 DRY_RUN=0
 PREFLIGHT_PROBLEMS=0
 
-# Only ever filled in on the fallback path (mirror or packages still private).
-# Never logged.
-GHCR_USER="${SLATE_GHCR_USER:-}"
-GHCR_TOKEN="${SLATE_GHCR_TOKEN:-}"
+# A registry credential handed in by a wrapper that already signed the
+# customer in on its own side (the Windows and macOS installers), or by CI.
+# Set, the browser sign-in is skipped. Never logged.
+REGISTRY_USER="${SLATE_REGISTRY_USER:-}"
+REGISTRY_TOKEN="${SLATE_REGISTRY_TOKEN:-}"
 
-PROMPT_RESULT=""
-
-# Where prompts read from. /dev/tty when there is one, so the script works
-# when piped into sh; stdin otherwise (CI, a heredoc of answers).
-#
-# The probe runs in a SUBSHELL, and that is not decoration. /dev/tty exists as
-# a character device even when the process has no controlling terminal - a CI
-# step, a systemd unit, cron - and opening it then fails with ENXIO. POSIX says
-# a redirection error on a SPECIAL built-in (`:`, `exec`, `eval`...) makes a
-# non-interactive shell exit, so `: < /dev/tty` did not return false here: it
-# killed the whole script, instantly, with status 2 and no message at all,
-# because the `2>/dev/null` meant to silence the probe swallowed the error too.
-# Measured: every run without a controlling terminal died at this line.
-# A subshell contains the exit, so the `if` sees a failed command as intended.
-PROMPT_IN=/dev/tty
-if ! ( [ -c /dev/tty ] && true < /dev/tty ) 2>/dev/null; then
-    PROMPT_IN=/dev/stdin
-fi
+# Which installer is asking, shown to the customer on the approval page.
+SLATE_INSTALLER_OS="${SLATE_INSTALLER_OS:-linux}"
 
 # ------------------------------------------------------------------- output
 
@@ -169,15 +159,15 @@ Environment (all optional):
                        desktop session), print (never open), or none.
   SLATE_INSTALL_DIR    Same as --install-dir.
   SLATE_DIST_RAW       Base URL of the public dist mirror (for testing).
-  SLATE_GHCR_USER      Only for the fallback below: GitHub username.
-  SLATE_GHCR_TOKEN     Only for the fallback below: a GitHub personal access
-                       token (classic) with read:packages AND repo. Never
+  SLATE_REGISTRY_USER  A registry.slatepanel.app credential from an earlier
+  SLATE_REGISTRY_TOKEN sign-in; set, the browser sign-in is skipped. Never
                        echoed, never written to the install directory.
 
-No credential is needed. The images are public packages and the files come
-from the public mirror github.com/dfalpha/slate-dist. If either is still
-private, the script says exactly that and offers to use a GitHub token
-instead - the same path it always had - rather than failing.
+Slate's images come from registry.slatepanel.app and need a Slate account
+with a licence. The installer asks for nothing: it shows a code and a link
+(and opens the link when there is a desktop), you approve this machine in
+your browser while signed in to your Slate account, and it carries on. The
+files come from the public mirror github.com/dfalpha/slate-dist.
 
 What it does:
   1. Refuses to run where Slate cannot work (not Linux, not root, inside a
@@ -188,7 +178,8 @@ What it does:
   4. Writes <install-dir>/.env without asking anything, using .env.example as
      the source of truth for which variables exist. Mode 0600, never inside a
      checkout.
-  5. Pulls the public images and brings the stack up with host networking.
+  5. Signs this machine in to registry.slatepanel.app (a browser approval,
+     once), pulls the images and brings the stack up with host networking.
   6. VERIFIES host networking - container network namespace vs the host's,
      plus an mDNS sanity probe - and fails loudly with the reason if it is
      not what the stack needs.
@@ -456,107 +447,128 @@ ensure_docker() {
     fi
 }
 
-# --------------------------------------------------------------- credentials
-
-# Reads a line without echoing it. POSIX sh has no `read -s`, so stty does the
-# work; if there is no tty (CI, a pipe) it falls back to a plain read. Reads
-# from $PROMPT_IN (/dev/tty when there is one), never bare stdin - see the
-# header for why that matters under `curl | sh`.
-read_secret() {
-    printf '%s: ' "$1" >&2
-    if [ "$PROMPT_IN" = /dev/tty ] && have stty; then
-        stty_saved=$(stty -g < "$PROMPT_IN" 2>/dev/null || printf '')
-        stty -echo < "$PROMPT_IN" 2>/dev/null || true
-        read -r PROMPT_RESULT < "$PROMPT_IN" || PROMPT_RESULT=""
-        if [ -n "$stty_saved" ]; then
-            stty "$stty_saved" < "$PROMPT_IN" 2>/dev/null || true
-        fi
-        printf '\n' >&2
-    else
-        read -r PROMPT_RESULT < "$PROMPT_IN" || PROMPT_RESULT=""
-    fi
-}
-
-# $1 prompt, $2 default
-read_value() {
-    if [ -n "${2:-}" ]; then
-        printf '%s [%s]: ' "$1" "$2" >&2
-    else
-        printf '%s: ' "$1" >&2
-    fi
-    read -r PROMPT_RESULT < "$PROMPT_IN" || PROMPT_RESULT=""
-    if [ -z "$PROMPT_RESULT" ]; then
-        PROMPT_RESULT="${2:-}"
-    fi
-}
-
-# $1 prompt (yes/no). Returns 0 for yes. Non-interactive runs answer no.
-ask_yes_no() {
-    [ "$PROMPT_IN" = /dev/tty ] || return 1
-    read_value "$1 [y/N]" ""
-    case "$PROMPT_RESULT" in
-        y|Y|yes|YES|Yes) return 0 ;;
-        *) return 1 ;;
-    esac
-}
-
-# The fallback path. Everything above this line works without a credential;
-# this is only reached when the mirror or the packages turn out to still be
-# private. $1 is the one-sentence reason, already printed by the caller.
+# ------------------------------------------------------- registry sign-in
 #
-# Interactive: offer the prompt. Non-interactive (no tty, no SLATE_GHCR_*):
-# there is nobody to ask, so die with the reason rather than hang on a read.
-collect_fallback_credentials() {
-    [ -n "$GHCR_USER" ] && [ -n "$GHCR_TOKEN" ] && return 0
+# Owner, 2026-09-24: the images live on registry.slatepanel.app and pulling
+# them needs a Slate account with a licence. The customer's portal password
+# never comes near this script - it runs as root on a machine nobody has
+# authenticated - so it is RFC 8628's device flow, the same one the Licence
+# tab uses to link a server:
+#
+#   1. ask the portal for a code          POST /registry/device/code
+#   2. show the code and link; open the link when there is a desktop
+#   3. the customer approves this machine in their browser
+#   4. poll until the credential arrives  POST /registry/device/token
+#   5. `docker login` with it, as root - Watchtower mounts root's docker
+#      config, so every later update uses the same credential
+#
+# The portal answers in key=value lines (Accept: text/plain): this is POSIX sh
+# under `curl | sh`, with no jq, and parsing JSON with sed breaks on the first
+# unusual character.
 
-    if [ "$PROMPT_IN" != /dev/tty ]; then
-        die "$1 Set SLATE_GHCR_USER and SLATE_GHCR_TOKEN (a classic GitHub token with read:packages and repo) and re-run."
-    fi
-    info "A GitHub personal access token (classic) with read:packages AND repo"
-    info "still works, exactly as before. It is used in memory only: never"
-    info "written to disk by this script, never printed, never on a command line."
-    ask_yes_no "Use a GitHub token now?" ||
-        die "$1 Re-run once the packages and github.com/dfalpha/slate-dist are public, or with SLATE_GHCR_USER / SLATE_GHCR_TOKEN set."
-
-    if [ -z "$GHCR_USER" ]; then
-        read_value "GitHub username" ""
-        GHCR_USER="$PROMPT_RESULT"
-    fi
-    if [ -z "$GHCR_TOKEN" ]; then
-        read_secret "GitHub token (input hidden)"
-        GHCR_TOKEN="$PROMPT_RESULT"
-        PROMPT_RESULT=""
-    fi
-    [ -n "$GHCR_USER" ] || die "A GitHub username is required."
-    [ -n "$GHCR_TOKEN" ] || die "A GitHub token is required."
-}
-
-ghcr_already_authenticated() {
+registry_already_authenticated() {
     [ -f "$HOME/.docker/config.json" ] || return 1
-    grep -q 'ghcr\.io' "$HOME/.docker/config.json"
+    grep -q "$SLATE_REGISTRY" "$HOME/.docker/config.json"
 }
 
-# Only on the fallback path. --password-stdin, so the token never appears in
-# the process list, the shell history or the terminal.
-ghcr_login() {
-    if ghcr_already_authenticated; then
-        info "A ghcr.io credential is already stored; refreshing it."
+# $1 = the key=value body, $2 = the key.
+kv() {
+    printf '%s\n' "$1" | sed -n "s/^$2=//p" | head -n 1
+}
+
+# POST a small JSON body read from stdin, so a device code is never on a
+# command line. Prints the body whatever the status: RFC 8628's "keep waiting"
+# answers are 400s.
+portal_post() {
+    curl -sS --max-time 30 -X POST -H 'Accept: text/plain' -H 'Content-Type: application/json' \
+        --data-binary @- "$SLATE_PORTAL$1"
+}
+
+# --password-stdin, so the credential never appears in the process list, the
+# shell history or the terminal.
+registry_login() {
+    printf '%s' "$REGISTRY_TOKEN" | docker login "$SLATE_REGISTRY" -u "$REGISTRY_USER" --password-stdin >/dev/null ||
+        die "docker login to $SLATE_REGISTRY failed with the credential this machine was given. Run the installer again to sign in afresh."
+    info "Signed in to $SLATE_REGISTRY."
+}
+
+# The browser sign-in. Fills REGISTRY_USER and REGISTRY_TOKEN, or dies saying
+# why. Waits as long as the code lives (ten minutes) and no longer.
+registry_device_flow() {
+    started=$(printf '{"os":"%s"}' "$SLATE_INSTALLER_OS" | portal_post /registry/device/code) ||
+        die "Could not reach $SLATE_PORTAL to sign in. Check this machine can reach the internet, then re-run."
+    device_code=$(kv "$started" device_code)
+    user_code=$(kv "$started" user_code)
+    verify_uri=$(kv "$started" verification_uri)
+    verify_full=$(kv "$started" verification_uri_complete)
+    interval=$(kv "$started" interval)
+    expires_in=$(kv "$started" expires_in)
+    [ -n "$device_code" ] && [ -n "$user_code" ] ||
+        die "The Slate portal did not start a sign-in ($(kv "$started" error)). Try again in a minute."
+    case "$interval" in ''|*[!0-9]*) interval=5 ;; esac
+    case "$expires_in" in ''|*[!0-9]*) expires_in=600 ;; esac
+
+    printf '\n'
+    log "Approve this machine with your Slate account to download Slate:"
+    log "  1. Open   $verify_uri"
+    log "  2. Enter  $user_code"
+    log "Sign in with the account that holds your Slate licence. The code lasts"
+    log "ten minutes; this installer carries on by itself once you approve."
+    if find_desktop_session; then
+        open_in_browser "${verify_full:-$verify_uri}"
+        log "(Opening it in your browser now.)"
     fi
-    printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin >/dev/null ||
-        die "docker login to ghcr.io failed. Check the username and that the token has the read:packages scope."
-    info "Logged in to ghcr.io."
+
+    waited=0
+    while [ "$waited" -lt "$expires_in" ]; do
+        sleep "$interval"
+        waited=$((waited + interval))
+        polled=$(printf '{"device_code":"%s"}' "$device_code" | portal_post /registry/device/token) || continue
+        REGISTRY_USER=$(kv "$polled" username)
+        REGISTRY_TOKEN=$(kv "$polled" password)
+        if [ -n "$REGISTRY_USER" ] && [ -n "$REGISTRY_TOKEN" ]; then
+            device_code=""
+            polled=""
+            info "Approved."
+            return 0
+        fi
+        case "$(kv "$polled" error)" in
+            authorization_pending) ;;
+            slow_down) interval=$((interval + 5)) ;;
+            access_denied)
+                die "The sign-in was refused, or the Slate account has no active licence. Start a trial or buy a licence at $SLATE_PORTAL, then re-run." ;;
+            expired_token)
+                die "The code expired before it was approved. Re-run the installer for a new one." ;;
+            *) ;;
+        esac
+    done
+    die "The code expired before it was approved. Re-run the installer for a new one."
+}
+
+# $1 = "force" to sign in again even with a stored credential (it was refused).
+registry_sign_in() {
+    if [ "$DRY_RUN" -eq 1 ]; then
+        info "[dry-run] would sign this machine in to $SLATE_REGISTRY: show a code and"
+        info "[dry-run] $SLATE_PORTAL/account/authorize-install, open it when there is a"
+        info "[dry-run] desktop, wait for approval, then docker login with the credential."
+        return 0
+    fi
+    if [ -n "$REGISTRY_USER" ] && [ -n "$REGISTRY_TOKEN" ]; then
+        registry_login
+        return 0
+    fi
+    if [ "${1:-}" != force ] && registry_already_authenticated; then
+        info "This machine is already signed in to $SLATE_REGISTRY."
+        return 0
+    fi
+    registry_device_flow
+    registry_login
 }
 
 # --------------------------------------------------------------- file fetch
 
-# $1 = path within the mirror, $2 = destination file.
-#
-# Anonymous, from the public dist mirror. A 404 is what raw.githubusercontent
-# returns for a repository that does not exist OR is private (GitHub does not
-# confirm a private repo exists to an unauthenticated caller), so a 404 here
-# means "the mirror is not public yet", and the fallback is the same file at
-# the same path in the private source repository, with a token. curl reads its
-# options from stdin (-K -) on that path so the header is not visible in `ps`.
+# $1 = path within the mirror, $2 = destination file. Anonymous, from the
+# public dist mirror; it needs no credential of any kind.
 fetch_repo_file() {
     fetch_url="$SLATE_DIST_RAW/$1"
     if [ "$DRY_RUN" -eq 1 ]; then
@@ -568,19 +580,7 @@ fetch_repo_file() {
         return 0
     fi
     rm -f "$2.part"
-
-    reason="The public mirror at $SLATE_DIST_RAW did not serve $1 - the dist repository is not public yet (or this machine cannot reach raw.githubusercontent.com)."
-    warn "$reason"
-    collect_fallback_credentials "$reason"
-
-    fetch_url="$SLATE_REPO_RAW/$1"
-    info "Fetching $1 from the source repository with the token instead."
-    printf 'header = "Authorization: token %s"\nsilent\nshow-error\nfail\nlocation\n' \
-        "$GHCR_TOKEN" |
-        curl -K - -o "$2.part" "$fetch_url" ||
-        die "Could not fetch $1 from the Slate repository either. The repo is private, so a token without the 'repo' scope gets a 404 rather than a 403 - GitHub's way of not confirming a private repo exists. Check the token's scopes."
-    [ -s "$2.part" ] || die "Fetched $1 but it was empty."
-    mv "$2.part" "$2"
+    die "Could not download $1 from $SLATE_DIST_RAW. Check this machine can reach raw.githubusercontent.com, then re-run."
 }
 
 fetch_stack_files() {
@@ -728,14 +728,16 @@ compose() {
 stack_up() {
     step "Starting the stack"
     if [ "$DRY_RUN" -eq 1 ]; then
-        printf '  [dry-run] docker compose -f %s -f %s pull %s   (anonymous; a token is offered only if ghcr.io refuses)
-'             "$INSTALL_DIR/docker-compose.yml"             "$INSTALL_DIR/infra/docker-compose.host-network.yml"             "$COMPOSE_SERVICES"
+        registry_sign_in
+        printf '  [dry-run] docker compose -f %s -f %s pull %s   (from %s, signed in)
+'             "$INSTALL_DIR/docker-compose.yml"             "$INSTALL_DIR/infra/docker-compose.host-network.yml"             "$COMPOSE_SERVICES" "$SLATE_REGISTRY"
         printf '  [dry-run] docker compose -f %s -f %s up -d %s
 '             "$INSTALL_DIR/docker-compose.yml"             "$INSTALL_DIR/infra/docker-compose.host-network.yml"             "$COMPOSE_SERVICES"
         info "[dry-run] caddy is in that list with or without a hostname - the"
         info "[dry-run] server configures it over its admin API once linked."
         return 0
     fi
+    registry_sign_in
     pull_images
     # Word splitting is intended here - it is a service list.
     # shellcheck disable=SC2086
@@ -744,13 +746,11 @@ stack_up() {
     info "Containers started."
 }
 
-# Anonymous first. A refused anonymous pull of a ghcr.io image means the
-# package is still private ("denied" / "unauthorized" from the registry), which
-# is a one-click owner action that may simply not have happened yet - so say
-# exactly that, offer the token, log in and pull again. Any other failure
-# (no network, a typo in the compose file) is reported as itself.
+# A refusal with a STORED credential means it was withdrawn from the portal or
+# the account's licence has lapsed: sign in afresh once, then pull again. Any
+# other failure (no network, a typo in the compose file) is reported as itself.
 pull_images() {
-    info "Pulling images (anonymous - the packages are public)."
+    info "Pulling images from $SLATE_REGISTRY."
     pull_log=$(mktemp)
     # shellcheck disable=SC2086
     if compose pull $COMPOSE_SERVICES >"$pull_log" 2>&1; then
@@ -760,17 +760,17 @@ pull_images() {
     if ! grep -qiE 'denied|unauthorized|authentication required|requested access to the resource is denied' "$pull_log"; then
         cat "$pull_log" >&2
         rm -f "$pull_log"
-        die "Could not pull the Slate images. This does not look like an authentication problem - check the output above and the network."
+        die "Could not pull the Slate images. This does not look like a sign-in problem - check the output above and the network."
     fi
     rm -f "$pull_log"
 
-    reason="ghcr.io refused the anonymous pull: the Slate images are not public packages yet, so pulling them needs a GitHub token with read:packages."
-    warn "$reason"
-    collect_fallback_credentials "$reason"
-    ghcr_login
+    warn "$SLATE_REGISTRY refused this machine's credential - it was withdrawn, or the Slate account has no active licence. Signing in again."
+    REGISTRY_USER=""
+    REGISTRY_TOKEN=""
+    registry_sign_in force
     # shellcheck disable=SC2086
     compose pull $COMPOSE_SERVICES ||
-        die "Could not pull the Slate images from ghcr.io even with the token. It needs the read:packages scope, and the account needs access to the dfalpha/slate packages."
+        die "Could not pull the Slate images even after signing in again. Check the Slate account at $SLATE_PORTAL has an active licence."
 }
 
 # ------------------------------------------------------------- verification

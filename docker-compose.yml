@@ -7,8 +7,14 @@ services:
   # (issue 0.11 revision). That retag *is* the deliberate trigger;
   # `watchtower` below just polls normally and picks up the new digest on
   # its own.
+  #
+  # Pulled from registry.slatepanel.app (owner decision 2026-09-24): Slate's own
+  # registry, open to Slate accounts with a licence. The installer signs the
+  # host in once (a browser approval) and the credential sits in root's docker
+  # config, which Watchtower mounts. Only PROMOTED builds are there; per-merge
+  # builds stay on GHCR (server-staging below).
   server:
-    image: ghcr.io/dfalpha/slate-server:production
+    image: registry.slatepanel.app/slate/server:production
     container_name: slate-server
     restart: unless-stopped
     labels:
@@ -182,7 +188,7 @@ services:
   # `:production` is moved by .github/workflows/promote-caddy.yml, which a
   # server promotion also calls.
   caddy:
-    image: ghcr.io/dfalpha/slate-caddy:production
+    image: registry.slatepanel.app/slate/caddy:production
     container_name: slate-caddy
     restart: unless-stopped
     labels:
@@ -233,7 +239,7 @@ services:
   # `:production` is moved by .github/workflows/promote-soloist.yml, which a
   # server promotion also calls. No depends_on, for the reason given on caddy.
   soloist:
-    image: ghcr.io/dfalpha/slate-soloist:production
+    image: registry.slatepanel.app/slate/soloist:production
     container_name: slate-soloist
     restart: unless-stopped
     labels:

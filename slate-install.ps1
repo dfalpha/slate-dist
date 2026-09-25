@@ -25,7 +25,7 @@
                                    Hyper-V firewall rules, the port-collision
                                    check, creates the distro, verifies it.
       2. slate-install.sh          INSIDE the distro, as root: Docker Engine,
-                                   the public images, .env with no prompts, the
+                                   the images (signed in), .env with no prompts, the
                                    stack on host networking, and a VERIFIED
                                    host-network check.
       3. slate-keepalive-task.ps1  The scheduled task (S4U, this user, never
@@ -57,20 +57,22 @@
     link must not land in a log.
 
 .PARAMETER NoBrowser
-    Print the first-setup link but do not open it.
+    Print the registry sign-in link and the first-setup link, but open neither.
 
 .NOTES
     Needs PowerShell 7 (New-NetFirewallHyperVRule does not exist in 5.1) and
     elevation. Both are checked first and explained, not assumed.
 
-    It asks nothing. Owner, 2026-09-15 (D12): "Browser opens; the setup wizard
-    creates the admin. Installers ask nothing." The server mints a single-use
-    first-setup token on its first start with no administrator; the last thing
-    this script does is ask it for the link and open it (Show-FirstSetup).
+    It types nothing into this window. Owner, 2026-09-15 (D12): "Browser opens;
+    the setup wizard creates the admin. Installers ask nothing." The server
+    mints a single-use first-setup token on its first start with no
+    administrator; the last thing this script does is ask it for the link and
+    open it (Show-FirstSetup).
 
-    SLATE_GHCR_USER / SLATE_GHCR_TOKEN, if set in this session, are passed into
-    the distro (WSLENV) for the Linux installer's fallback when the images or
-    the mirror are still private. Nothing here needs them otherwise.
+    The one interaction (owner, 2026-09-24) is approving this PC in the browser
+    so it may download Slate from registry.slatepanel.app: Invoke-RegistrySignIn
+    shows a code, opens the approval page, and waits. SLATE_REGISTRY_USER /
+    SLATE_REGISTRY_TOKEN, if already set in this session, skip that step.
 #>
 [CmdletBinding()]
 param(
@@ -89,7 +91,9 @@ if (-not $InstallRoot) {
     $InstallRoot = if ($env:ProgramData) { Join-Path $env:ProgramData 'Slate' } else { '/tmp/slate-install-dry-run' }
 }
 $InstallDir   = Join-Path $InstallRoot 'install'
+$PortalBase   = 'https://portal.slatepanel.app'
 $PortalLink   = 'https://portal.slatepanel.app/account/link'
+$Registry     = 'registry.slatepanel.app'
 # Run inside the distro: prints (or with --new, rotates) the server's
 # single-use first-setup link.
 $SetupUrlCommand = 'docker exec slate-server node dist/cli/firstSetupUrl.js'
@@ -256,6 +260,87 @@ function Invoke-WindowsSetup {
     if (-not $ok) { Die "slate-windows-setup.ps1 failed (exit $LASTEXITCODE). Its own message above says why; fix that and run this line again." }
 }
 
+# ------------------------------------------------------- registry sign-in --
+# Owner, 2026-09-24: Slate's images are served from registry.slatepanel.app to
+# Slate accounts with a licence. The customer approves this PC in the browser
+# (RFC 8628 device code, the same flow the Licence tab uses); the credential
+# that comes back goes into the distro through WSLENV and the Linux installer
+# logs in with it. Done HERE, on Windows, because the browser is here - inside
+# the distro there is none. The portal password never reaches this script.
+#
+# The code and link are printed (SlateSetup.exe shows this console), and the
+# link opens through explorer.exe so the browser is not elevated. The code is
+# not a secret on its own: it only works for somebody signed in to an account
+# with a licence, within ten minutes.
+function Test-RegistrySignedIn {
+    if (-not $IsWindows) { return $false }
+    try {
+        & wsl.exe -d $Distro -u root -e sh -c "grep -q '$Registry' /root/.docker/config.json" 2>$null
+        return ($LASTEXITCODE -eq 0)
+    } catch { return $false }
+}
+
+function Invoke-RegistrySignIn {
+    Step "Approve this PC with your Slate account ($Registry)"
+    if ($env:SLATE_REGISTRY_USER -and $env:SLATE_REGISTRY_TOKEN) {
+        Say "A registry credential was supplied; using it."
+        return
+    }
+    if ($DryRun) {
+        Say "[dry-run] would show a code and $PortalBase/account/authorize-install, open it in the browser,"
+        Say "[dry-run] wait for approval, and hand the credential to the Linux installer."
+        return
+    }
+    if (Test-RegistrySignedIn) {
+        Say "This PC is already signed in to $Registry."
+        return
+    }
+    try {
+        $start = Invoke-RestMethod -Method Post -Uri "$PortalBase/registry/device/code" -ContentType 'application/json' -Body '{"os":"windows"}' -TimeoutSec 30
+    } catch {
+        Die "Could not reach $PortalBase to sign in ($($_.Exception.Message)). Check this PC can reach the internet, then run this line again."
+    }
+    Write-Host ""
+    Write-Host "To download Slate, approve this PC with your Slate account:"
+    Write-Host "  1. Open   $($start.verification_uri)"
+    Write-Host "  2. Enter  $($start.user_code)"
+    Write-Host "Sign in with the account that holds your Slate licence. The code lasts ten"
+    Write-Host "minutes; this installer carries on by itself once you approve."
+    if (-not $NoBrowser) {
+        try { Start-Process -FilePath explorer.exe -ArgumentList $start.verification_uri_complete } catch { }
+    }
+
+    $interval = [int]($start.interval ?? 5)
+    $deadline = (Get-Date).AddSeconds([int]($start.expires_in ?? 600))
+    $body = @{ device_code = $start.device_code } | ConvertTo-Json -Compress
+    $start = $null
+    while ((Get-Date) -lt $deadline) {
+        Start-Sleep -Seconds $interval
+        try {
+            $res = Invoke-WebRequest -Method Post -Uri "$PortalBase/registry/device/token" -ContentType 'application/json' -Body $body -SkipHttpErrorCheck -TimeoutSec 30
+            $answer = $res.Content | ConvertFrom-Json
+        } catch { continue }
+        if ($answer.username -and $answer.password) {
+            # Into this process's environment only, forwarded to the distro by
+            # WSLENV (Invoke-LinuxInstaller). Never printed, never on disk here.
+            $env:SLATE_REGISTRY_USER = $answer.username
+            $env:SLATE_REGISTRY_TOKEN = $answer.password
+            $answer = $null
+            $body = $null
+            Say "Approved."
+            return
+        }
+        switch ($answer.error) {
+            'authorization_pending' { }
+            'slow_down' { $interval += 5 }
+            'access_denied' { Die "The sign-in was refused, or the Slate account has no active licence. Start a trial or buy a licence at $PortalBase, then run this line again." }
+            'expired_token' { Die "The code expired before it was approved. Run this line again for a new one." }
+            default { }
+        }
+    }
+    Die "The code expired before it was approved. Run this line again for a new one."
+}
+
 # ------------------------------------------------------ the linux installer --
 function Invoke-LinuxInstaller {
     Step "Inside the distro: slate-install.sh (Docker, images, .env, the stack, verification)"
@@ -265,12 +350,14 @@ function Invoke-LinuxInstaller {
     # script uses for /etc/wsl.conf, proven on the production host.
     $lin = 'sh "$(wslpath -u ' + "'$shPath'" + ')"'
     # Forwarded into the distro. WSLENV names variables to copy out of THIS
-    # process's environment, so an unset one simply arrives empty: the GHCR
-    # pair is for the private-images fallback. SLATE_FIRST_SETUP=none tells the
-    # Linux installer to say nothing about the first-setup link - this script
-    # fetches it at the end and opens it on Windows (Show-FirstSetup).
+    # process's environment, so an unset one simply arrives empty: the registry
+    # pair is the credential Invoke-RegistrySignIn collected (empty when the
+    # distro was already signed in). SLATE_FIRST_SETUP=none tells the Linux
+    # installer to say nothing about the first-setup link - this script fetches
+    # it at the end and opens it on Windows (Show-FirstSetup).
     $env:SLATE_FIRST_SETUP = 'none'
-    $env:WSLENV = 'SLATE_GHCR_USER:SLATE_GHCR_TOKEN:SLATE_DIST_RAW:SLATE_FIRST_SETUP'
+    $env:SLATE_INSTALLER_OS = 'windows'
+    $env:WSLENV = 'SLATE_REGISTRY_USER:SLATE_REGISTRY_TOKEN:SLATE_INSTALLER_OS:SLATE_DIST_RAW:SLATE_FIRST_SETUP'
     $ok = Invoke-Action "wsl -d $Distro -u root -e sh -c `"$lin`"" {
         & wsl.exe -d $Distro -u root -e sh -c $lin
     }
@@ -415,6 +502,7 @@ if ($DryRun) { Write-Host "(dry run - nothing will be changed)" }
 Invoke-Preflight
 Get-DistFiles
 Invoke-WindowsSetup
+Invoke-RegistrySignIn
 Invoke-LinuxInstaller
 Register-Keepalive
 Show-Finish
