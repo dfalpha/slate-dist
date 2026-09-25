@@ -22,6 +22,15 @@ services:
     ports:
       - "8080:8080"      # HTTP API + admin + viewer (LAN only)
       # WebSocket shares the HTTP port; WebRTC signaling rides the same server.
+      #
+      # AirPlay (backlog 7.6, OFF until the Cast tab's switch is on) listens
+      # on TCP 47830-47869 (RTSP, one per offered speaker) and TCP+UDP
+      # 47870-47909 (each phone session's audio and event sockets) - see
+      # server/src/airplay/ports.ts, SLATE_AIRPLAY_RTSP_PORTS/_AUDIO_PORTS in
+      # .env.example. Not published here: AirPlay needs mDNS on the real LAN,
+      # which only the supported host-network deployment
+      # (infra/docker-compose.host-network.yml) has, and there the server binds
+      # the host's own ports directly - no new service, nothing to publish.
     volumes:
       # One volume for the whole SLATE_DATA_DIR tree (config/, recordings/,
       # slideshow/, eufy/, and whatever future subdirectory the server code

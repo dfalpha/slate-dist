@@ -187,6 +187,13 @@ New-SlateRule 'Slate-Spotify'   'Slate: Spotify stream + pairing'       'TCP' @(
 New-SlateRule 'Slate-MediaMTX'  'Slate: mediamtx WHEP/ICE'              'TCP' @('8889','8189')
 New-SlateRule 'Slate-MediaMTXU' 'Slate: mediamtx ICE'                   'UDP' @('8189')
 New-SlateRule 'Slate-Ephemeral' 'Slate: ephemeral UDP (ICE/HAP/Matter)' 'UDP' @('32768-60999')
+# AirPlay (backlog 7.6): the phone connects IN to the RTSP port of the speaker
+# it picked, then to that session's event and audio ports. Fixed ranges since
+# PR 3 (server/src/airplay/ports.ts) so they can be named here; the UDP half
+# is inside the ephemeral rule above already, and listed anyway so this rule
+# still covers AirPlay if that one is ever narrowed.
+New-SlateRule 'Slate-AirPlay'   'Slate: AirPlay RTSP + audio'           'TCP' @('47830-47909')
+New-SlateRule 'Slate-AirPlayU'  'Slate: AirPlay realtime audio'         'UDP' @('47870-47909')
 
 # --------------------------------------------- port collisions with Windows --
 # Mirrored means Linux and Windows share one address. A Windows service already

@@ -32,6 +32,12 @@
 # supported deployment for doorbell video. Its RTSP port is pinned to
 # loopback here, because the only publisher is the server sharing this same
 # namespace and there is no reason for the raw feed to be on the LAN at all.
+#
+# AirPlay (backlog 7.6) needs nothing here either: on host networking the
+# server's receivers bind the host's TCP 47830-47869 and TCP+UDP 47870-47909
+# themselves (server/src/airplay/ports.ts). A host firewall has to let those
+# in from the LAN; slate-windows-setup.ps1 does it for a WSL host, and
+# infra/install/README.md says what to open on a Linux one.
 services:
   server:
     network_mode: host
