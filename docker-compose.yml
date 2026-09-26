@@ -239,11 +239,15 @@ services:
   # DELIBERATELY NOT ON HOST NETWORKING, even where everything else is. A
   # Spotify Connect device on the LAN can be picked - and taken over - from
   # any phone in the house. On this bridge network it is invisible; the
-  # server reaches it on the loopback ports below, and only opens a pairing
-  # window onto the LAN when an admin asks (server/src/soloist/pairing.ts).
+  # server reaches it on the loopback ports below and speaks for it on the
+  # LAN (server/src/soloist/advertiser.ts), sending other accounts' phones to
+  # the guest player so none of them can take the dedicated sign-in over.
   #
   # Ports, all loopback-only: 47820 supervisor control, 47821 Soloist's own
-  # WebSocket, 47822 the audio (raw PCM), 47823 Soloist's pairing endpoint.
+  # WebSocket, 47822 the audio (raw PCM), 47823 Soloist's zeroconf endpoint,
+  # 47825/47826 the guest player's WebSocket and zeroconf endpoint (the
+  # throwaway second Soloist every other account's phone signs in to; see
+  # server/src/soloist/guestMirror.ts).
   #
   # `:production` is moved by .github/workflows/promote-soloist.yml, which a
   # server promotion also calls. No depends_on, for the reason given on caddy.
@@ -258,6 +262,13 @@ services:
       - "127.0.0.1:47821:47821"
       - "127.0.0.1:47822:47822"
       - "127.0.0.1:47823:47823"
+      - "127.0.0.1:47825:47825"
+      - "127.0.0.1:47826:47826"
+    # The guest player's sign-in lives here and only here: memory, never the
+    # disk, wiped every time a phone lets it go. uid 10001 is the image's
+    # 'slate' user.
+    tmpfs:
+      - /guest:size=256m,mode=0700,uid=10001,gid=10001
     volumes:
       # The key, the downloaded Soloist build and its sign-in. Losing it means
       # a re-download and a re-pair, not lost music - the server hands the key
