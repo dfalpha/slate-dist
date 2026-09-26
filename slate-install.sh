@@ -66,8 +66,11 @@ SLATE_PORTAL_LINK_URL="https://portal.slatepanel.app/account/link"
 # named explicitly: naming any service on the command line starts only the
 # named ones, and forgetting mediamtx is exactly how doorbell video ran broken
 # on every host for weeks (infra/README.md, 2026-08-28). soloist is Spotify's
-# player (build PR 4): without it Spotify is simply off.
-COMPOSE_SERVICES="server caddy watchtower mediamtx soloist"
+# player (build PR 4): without it Spotify is simply off. updater is the stack
+# updater (infra/updater/): it keeps docker-compose.yml and the host-network
+# override at the promoted release from here on, so a compose change never
+# again needs this installer re-run.
+COMPOSE_SERVICES="server caddy watchtower mediamtx soloist updater"
 
 # The host-shell command that prints (or with --new, rotates) the server's
 # single-use first-setup link. The server mints the token itself on its first
@@ -644,6 +647,10 @@ env_installer_default() {
         SLATE_HOST_LAN_IP) printf '' ;;
         SLATE_RESET_ADMIN_PASSWORD) printf 'false' ;;
         WATCHTOWER_POLL_INTERVAL) printf '300' ;;
+        # The stack updater mounts the install directory at this same path,
+        # which it can only know from here: compose has no variable for its
+        # own project directory.
+        SLATE_INSTALL_DIR) printf '%s' "$INSTALL_DIR" ;;
         *) printf '' ;;
     esac
 }
@@ -705,11 +712,22 @@ write_env() {
 
 # --------------------------------------------------------------- bring it up
 
+# docker-compose.local.yml is the owner's own customisation - the one compose
+# file nothing Slate ships ever writes (the stack updater included). Layered
+# last when it exists, exactly as the stack updater layers it.
 compose() {
-    docker compose \
-        -f "$INSTALL_DIR/docker-compose.yml" \
-        -f "$INSTALL_DIR/infra/docker-compose.host-network.yml" \
-        "$@"
+    if [ -f "$INSTALL_DIR/docker-compose.local.yml" ]; then
+        docker compose \
+            -f "$INSTALL_DIR/docker-compose.yml" \
+            -f "$INSTALL_DIR/infra/docker-compose.host-network.yml" \
+            -f "$INSTALL_DIR/docker-compose.local.yml" \
+            "$@"
+    else
+        docker compose \
+            -f "$INSTALL_DIR/docker-compose.yml" \
+            -f "$INSTALL_DIR/infra/docker-compose.host-network.yml" \
+            "$@"
+    fi
 }
 
 # CADDY STARTS EVEN WITH NO HOSTNAME, AND THAT IS THE POINT.

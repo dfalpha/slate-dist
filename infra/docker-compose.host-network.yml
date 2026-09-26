@@ -79,3 +79,11 @@ services:
   # LAN.
   caddy:
     network_mode: host
+
+  # The stack updater health-checks the server at its own /health after it
+  # changes anything; in this namespace that is loopback. It listens on
+  # nothing, so host networking exposes nothing.
+  updater:
+    network_mode: host
+    environment:
+      - SLATE_UPDATER_HEALTH_URL=http://127.0.0.1:8080/health

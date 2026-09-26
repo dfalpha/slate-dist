@@ -303,6 +303,51 @@ services:
       - WATCHTOWER_CLEANUP=true
       - WATCHTOWER_POLL_INTERVAL=${WATCHTOWER_POLL_INTERVAL:-300}
 
+  # The stack updater (owner, 2026-09-26: "server updates for pretty much
+  # anything without rerunning an installer"). Watchtower swaps IMAGES; this
+  # swaps the FILES - this docker-compose.yml, the host-network override and
+  # .env.example - which nothing else ever changed after the installer wrote
+  # them. The image carries the release's copies; on every start (and
+  # Watchtower restarts it whenever a promotion moves `:production`) it
+  # validates them against this install's .env and docker-compose.local.yml,
+  # backs up and replaces the host's copies, `up`s only the services whose
+  # definition changed, health-checks, and rolls back on failure. It never
+  # writes .env or docker-compose.local.yml. See infra/README.md.
+  #
+  # Same privilege class as `watchtower`: the Docker socket, plus the install
+  # directory mounted AT ITS OWN PATH, so compose run from inside resolves
+  # every path exactly as the host's `docker compose` does and the containers
+  # it recreates keep their labels. `.` is the install directory (the project
+  # directory); SLATE_INSTALL_DIR names the same path for the target, and the
+  # installer writes it into .env - /opt/slate is the installer's default.
+  #
+  # Listens on nothing. Its report goes to the server's data volume
+  # (/data/stack-updater/status.json), which the admin panel's System >
+  # Settings page reads.
+  updater:
+    image: registry.slatepanel.app/slate/updater:production
+    container_name: slate-updater
+    restart: unless-stopped
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - .:${SLATE_INSTALL_DIR:-/opt/slate}
+      # Registry sign-in, for pulling an image a new service needs - the
+      # same credential Watchtower reads.
+      - ${HOME}/.docker:/config:ro
+      - slate-data:/srv/slate
+    environment:
+      - DOCKER_CONFIG=/config
+      # compose interpolates ${HOME} (watchtower's mount above); the updater
+      # hands it the host's value so nothing resolves differently.
+      - SLATE_HOST_HOME=${HOME}
+      - SLATE_UPDATER_SELF=slate-updater
+      - SLATE_UPDATER_STATUS_DIR=/srv/slate/stack-updater
+      # By service name on this network; the host-network override points it
+      # at loopback.
+      - SLATE_UPDATER_HEALTH_URL=http://server:8080/health
+
 volumes:
   slate-data:
   slate-data-staging:
