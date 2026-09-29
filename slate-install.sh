@@ -179,7 +179,8 @@ What it does:
   3. Fetches docker-compose.yml, infra/docker-compose.host-network.yml and
      .env.example from the dist mirror, anonymously.
   4. Writes <install-dir>/.env without asking anything, using .env.example as
-     the source of truth for which variables exist. Mode 0600, never inside a
+     the source of truth for which variables exist, plus TZ set to this
+     machine's time zone (or SLATE_TZ when set). Mode 0600, never inside a
      checkout.
   5. Signs this machine in to registry.slatepanel.app (a browser approval,
      once), pulls the images and brings the stack up with host networking.
@@ -670,6 +671,114 @@ env_resolved_value() {
     printf '%s' "$resolved"
 }
 
+# ------------------------------------------------------------- time zone
+#
+# THE HOUSE'S TIME ZONE GOES IN .env AS TZ (14.42, owner-approved 2026-09-26).
+# The server image defaults to one zone; a house anywhere else would see its
+# calendar day, its commute polling window and its schedules run on the wrong
+# clock. The zone is read from the machine, never asked for (D12). The Windows
+# and macOS wrappers run this script inside a VM whose own zone is usually UTC,
+# so they read the zone on the real computer and pass it in as SLATE_TZ.
+#
+# TZ is never written EMPTY. A bare `TZ=` in an env_file sets TZ to the empty
+# string inside the container, which overrides the image and silently means
+# UTC - which is why .env.example documents TZ in a comment and does not list
+# it as a variable.
+
+# True when $1 looks like an IANA zone name ("Area/City", up to three parts)
+# and, where this machine has a zone database, names a real zone in it. No
+# "..", no leading ":" or "/", so the value can never walk out of zoneinfo.
+valid_time_zone() {
+    [ -n "$1" ] || return 1
+    printf '%s\n' "$1" | grep -Eq '^[A-Za-z][A-Za-z0-9_+-]*(/[A-Za-z0-9_+-]+){0,2}$' || return 1
+    if [ -d /usr/share/zoneinfo ]; then
+        [ -f "/usr/share/zoneinfo/$1" ] || return 1
+    fi
+    return 0
+}
+
+# The zone this machine is set to, or nothing. SLATE_TZ (from a wrapper) wins
+# because inside WSL or a Lima VM it is the only trustworthy answer.
+detect_time_zone() {
+    if [ -n "${SLATE_TZ:-}" ]; then
+        printf '%s' "$SLATE_TZ"
+        return 0
+    fi
+    if command -v timedatectl >/dev/null 2>&1; then
+        detected=$(timedatectl show -p Timezone --value 2>/dev/null || true)
+        if [ -n "$detected" ]; then
+            printf '%s' "$detected"
+            return 0
+        fi
+    fi
+    if [ -r /etc/timezone ]; then
+        detected=$(head -n 1 /etc/timezone | tr -d '[:space:]')
+        if [ -n "$detected" ]; then
+            printf '%s' "$detected"
+            return 0
+        fi
+    fi
+    if [ -L /etc/localtime ]; then
+        detected=$(readlink -f /etc/localtime 2>/dev/null || true)
+        case "$detected" in
+            */zoneinfo/*) printf '%s' "${detected#*/zoneinfo/}" ;;
+            *) ;;
+        esac
+    fi
+}
+
+# The TZ this install should carry, or nothing (the image default then
+# applies). A valid TZ already in .env wins, so a re-run keeps what the
+# operator set; then the detected zone. An invalid value from either source
+# is warned about and ignored, never written. $1 the existing .env.
+resolve_time_zone() {
+    existing_tz=$(env_current_value "$1" TZ)
+    if [ -n "$existing_tz" ]; then
+        if valid_time_zone "$existing_tz"; then
+            printf '%s' "$existing_tz"
+            return 0
+        fi
+        warn "Ignoring TZ=$existing_tz in the existing .env: it is not a time zone this machine knows."
+    fi
+    candidate_tz=$(detect_time_zone)
+    if [ -n "$candidate_tz" ]; then
+        if valid_time_zone "$candidate_tz"; then
+            printf '%s' "$candidate_tz"
+            return 0
+        fi
+        warn "Ignoring the detected time zone '$candidate_tz': it is not a valid zone name."
+    fi
+}
+
+# Appends TZ=<zone> to the .env being written ($2), or nothing when no zone is
+# known. $1 the existing .env. With $2 empty (dry run) it only reports.
+write_time_zone() {
+    TZ_SOURCE=""
+    zone=$(resolve_time_zone "$1")
+    # resolve_time_zone runs in a command substitution, so it cannot set a
+    # variable here; an unchanged value from the existing .env is the only
+    # case that is not "from this machine".
+    if [ -n "$zone" ] && [ "$(env_current_value "$1" TZ)" = "$zone" ]; then
+        TZ_SOURCE="kept from the existing .env"
+    else
+        TZ_SOURCE="from this machine"
+    fi
+    if [ -z "$zone" ]; then
+        info "Time zone: not detected (the server image's default applies)"
+        warn "Could not tell this machine's time zone; the server image's default applies. Add TZ=<Area/City> to $INSTALL_DIR/.env and re-run to set it."
+        return 0
+    fi
+    info "Time zone: $zone ($TZ_SOURCE)"
+    case "$zone" in
+        UTC|Etc/UTC|Etc/UCT|UCT|Universal|Etc/Universal|Zulu|Etc/Zulu)
+            warn "This machine is set to UTC, so Slate's calendar day and schedules will run on UTC. If the house is elsewhere, set TZ=<Area/City> (for example TZ=Europe/London) in $INSTALL_DIR/.env and re-run this installer." ;;
+        *) ;;
+    esac
+    if [ -n "$2" ]; then
+        printf 'TZ=%s\n' "$zone" >> "$2"
+    fi
+}
+
 # Nothing in here asks a question. The first administrator is not an
 # installer setting at all any more: the server has none until somebody opens
 # the first-setup link at the end of this script and creates one (D12).
@@ -682,6 +791,8 @@ write_env() {
         info "[dry-run] existing .env, then this installer's own defaults, then"
         info "[dry-run] .env.example's. It asks nothing: the administrator is"
         info "[dry-run] created in the browser afterwards."
+        write_time_zone "$INSTALL_DIR/.env" ""
+        info "[dry-run] ...plus that TZ line, when a zone is known."
         return 0
     fi
 
@@ -704,6 +815,7 @@ write_env() {
         printf '%s=%s\n' "$var" "$value" >> "$tmp_file"
     done
     value=""
+    write_time_zone "$env_file" "$tmp_file"
 
     mv "$tmp_file" "$env_file"
     chmod 600 "$env_file"

@@ -548,6 +548,23 @@ registry_sign_in() {
     die "The code expired before it was approved. Re-run the installer for a new one."
 }
 
+# This Mac's IANA time zone ("Area/City"), or nothing. The Lima VM's own zone
+# is UTC whatever the Mac says, so the Linux installer inside it is handed this
+# one as SLATE_TZ and writes it to .env as TZ (14.42, owner-approved
+# 2026-09-26). macOS keeps /etc/localtime as a symlink into
+# /var/db/timezone/zoneinfo/<zone>. Only a name made of the characters a zone
+# name can contain is returned, because it goes into the VM's command line.
+host_time_zone() {
+    host_tz=$(readlink /etc/localtime 2>/dev/null || true)
+    case "$host_tz" in
+        */zoneinfo/*) host_tz="${host_tz#*/zoneinfo/}" ;;
+        *) return 0 ;;
+    esac
+    if printf '%s\n' "$host_tz" | grep -Eq '^[A-Za-z][A-Za-z0-9_+-]*(/[A-Za-z0-9_+-]+){0,2}$'; then
+        printf '%s' "$host_tz"
+    fi
+}
+
 # The Linux installer, unchanged, inside the VM. Downloaded to a file first
 # rather than `curl | sh`.
 #
@@ -562,13 +579,19 @@ registry_sign_in() {
 run_linux_installer() {
     step "Running the Linux installer inside the VM"
     inner="curl -fsSL -o /tmp/slate-install.sh $SLATE_DIST_RAW/slate-install.sh && sh /tmp/slate-install.sh"
+    # Empty when the Mac's zone is unknown: the Linux installer then falls
+    # back to its own detection. host_time_zone only returns safe characters.
+    tz_export=""
+    mac_tz=$(host_time_zone)
+    [ -z "$mac_tz" ] || tz_export=" SLATE_TZ=$mac_tz"
     if [ "$DRY_RUN" -eq 1 ]; then
-        info "[dry-run] limactl shell $VM_NAME -- sudo sh -c '<credential on stdin>; SLATE_FIRST_SETUP=none $inner'"
+        info "Time zone: ${mac_tz:-unknown} (from this Mac)"
+        info "[dry-run] limactl shell $VM_NAME -- sudo sh -c '<credential on stdin>; SLATE_FIRST_SETUP=none$tz_export $inner'"
         return 0
     fi
     # shellcheck disable=SC2016 # $u and $t expand inside the VM, on purpose.
     printf '%s\n%s\n' "$REGISTRY_USER" "$REGISTRY_TOKEN" |
-        limactl shell "$VM_NAME" -- sudo sh -c 'read -r u; read -r t; export SLATE_REGISTRY_USER="$u" SLATE_REGISTRY_TOKEN="$t" SLATE_FIRST_SETUP=none SLATE_INSTALLER_OS=mac; '"$inner" ||
+        limactl shell "$VM_NAME" -- sudo sh -c 'read -r u; read -r t; export SLATE_REGISTRY_USER="$u" SLATE_REGISTRY_TOKEN="$t" SLATE_FIRST_SETUP=none SLATE_INSTALLER_OS=mac'"$tz_export; $inner" ||
         die "The Linux installer failed inside the VM. Its own message above says why; re-run this script once it is fixed - everything up to here is reused."
 }
 

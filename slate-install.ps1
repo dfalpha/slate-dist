@@ -341,6 +341,26 @@ function Invoke-RegistrySignIn {
     Die "The code expired before it was approved. Run this line again for a new one."
 }
 
+# ---------------------------------------------------------------- time zone --
+# This PC's IANA time zone ("Area/City"), or $null. The WSL distro's own zone
+# is usually UTC whatever Windows says, so the Linux installer is handed this
+# one as SLATE_TZ and writes it to .env as TZ (14.42, owner-approved
+# 2026-09-26). Windows names zones its own way ("Eastern Standard Time"); the
+# region argument picks the right city for the country, so Eastern + CA is
+# America/Toronto rather than America/New_York. Needs .NET 6+, which the
+# PowerShell 7 this script already requires provides. Asks nothing (D12).
+function Get-HouseTimeZone {
+    try {
+        $region = [Globalization.RegionInfo]::CurrentRegion.TwoLetterISORegionName
+        $iana = $null
+        if ([TimeZoneInfo]::TryConvertWindowsIdToIanaId([TimeZoneInfo]::Local.Id, $region, [ref]$iana) -and
+            $iana -match '^[A-Za-z][A-Za-z0-9_+-]*(/[A-Za-z0-9_+-]+){0,2}$') {
+            return $iana
+        }
+    } catch { }
+    return $null
+}
+
 # ------------------------------------------------------ the linux installer --
 function Invoke-LinuxInstaller {
     Step "Inside the distro: slate-install.sh (Docker, images, .env, the stack, verification)"
@@ -358,6 +378,16 @@ function Invoke-LinuxInstaller {
     $env:SLATE_FIRST_SETUP = 'none'
     $env:SLATE_INSTALLER_OS = 'windows'
     $env:WSLENV = 'SLATE_REGISTRY_USER:SLATE_REGISTRY_TOKEN:SLATE_INSTALLER_OS:SLATE_DIST_RAW:SLATE_FIRST_SETUP'
+    # The house's zone, read here because the distro cannot see it. Nothing is
+    # forwarded when it is unknown; the Linux installer then detects its own.
+    $houseTz = Get-HouseTimeZone
+    if ($houseTz) {
+        Say "Time zone: $houseTz (from this PC)"
+        $env:SLATE_TZ = $houseTz
+        $env:WSLENV = $env:WSLENV + ':SLATE_TZ'
+    } else {
+        Warn "Could not tell this PC's time zone; the Linux installer will use its own."
+    }
     $ok = Invoke-Action "wsl -d $Distro -u root -e sh -c `"$lin`"" {
         & wsl.exe -d $Distro -u root -e sh -c $lin
     }
