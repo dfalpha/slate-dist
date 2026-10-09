@@ -220,6 +220,15 @@ if ($collision) {
 }
 
 # ------------------------------------------------------------ the distro ----
+# What to check when WSL cannot make or start a distro. A VIRTUAL MACHINE is the
+# common case: WSL2 is itself a small VM, so it needs the Virtual Machine
+# Platform feature inside the guest AND nested virtualization exposed by the
+# host - off by default in Hyper-V.
+$WslHelp = "Run 'wsl --install -d $UbuntuImage --name $Distro --no-launch' yourself to see WSL's own message. " +
+    "Usual causes: the Virtual Machine Platform feature is off (wsl --install --no-distribution, then restart), " +
+    "virtualization is off in the BIOS, or - on a virtual machine - nested virtualization is not enabled on its host " +
+    "(Hyper-V, with the VM off: Set-VMProcessor -VMName <name> -ExposeVirtualizationExtensions `$true)."
+
 if (-not $SkipDistroCreate) {
     $existing = (wsl.exe --list --quiet) -replace "`0", '' -split "`r?`n" |
         ForEach-Object { $_.Trim() } | Where-Object { $_ }
@@ -228,7 +237,14 @@ if (-not $SkipDistroCreate) {
     } else {
         Say "Creating distro '$Distro' from $UbuntuImage (this downloads a few hundred MB)"
         wsl.exe --install -d $UbuntuImage --name $Distro --no-launch --vhd-size "${VhdSizeGb}GB"
-        if ($LASTEXITCODE -ne 0) { Die "wsl --install failed ($LASTEXITCODE)." }
+        if ($LASTEXITCODE -ne 0) { Die "wsl --install failed ($LASTEXITCODE). $WslHelp" }
+        # TRUST, THEN CHECK. A clean VM on 2026-10-01 ended with no distro at
+        # all while the rest of Setup carried on; the list is the ground truth.
+        $existing = (wsl.exe --list --quiet) -replace "`0", '' -split "`r?`n" |
+            ForEach-Object { $_.Trim() } | Where-Object { $_ }
+        if ($existing -notcontains $Distro) {
+            Die "wsl --install reported success but there is no '$Distro' distro afterwards. $WslHelp"
+        }
     }
 
     # systemd, so dockerd runs as a service and returns with the distro.
@@ -268,6 +284,11 @@ printf 'v6_linklocal=%s\n' "$(ip -6 -o addr show scope link 2>/dev/null | awk 'N
     $run = 'bash "$(wslpath ' + "'$tmp2'" + ')"'
     $out = wsl.exe -d $Distro -u root -e sh -c $run
     $out | ForEach-Object { Say "  $_" }
+    # A distro that cannot START prints wsl.exe's error instead of these lines.
+    # That is the end of the road on Windows: everything after runs inside it.
+    if (($out -join "`n") -notmatch 'networking=') {
+        Die "'$Distro' exists but could not be started. $WslHelp"
+    }
 
     if ($out -notmatch 'networking=mirrored') {
         Warn "NOT in mirrored mode. mDNS and IPv6 link-local will not work."

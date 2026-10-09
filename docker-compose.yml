@@ -4,21 +4,25 @@ services:
   # Production tracks a dedicated :production tag, not :latest - it only
   # moves when the "Promote Server Build to Production" GitHub Actions
   # workflow retags a specific, already-published :sha-<commit> build
-  # (issue 0.11 revision). That retag *is* the deliberate trigger;
-  # `watchtower` below just polls normally and picks up the new digest on
-  # its own.
+  # (issue 0.11 revision). That retag *is* the deliberate trigger; the stack
+  # `updater` below picks up the new digest - on its own poll while Automatic
+  # Updates are on (the default), or when someone presses Update Now in the
+  # admin panel while they are off (wave 11, owner 2026-09-28).
   #
   # Pulled from registry.slatepanel.app (owner decision 2026-09-24): Slate's own
   # registry, open to Slate accounts with a licence. The installer signs the
   # host in once (a browser approval) and the credential sits in root's docker
-  # config, which Watchtower mounts. Only PROMOTED builds are there; per-merge
+  # config, which the updater mounts. Only PROMOTED builds are there; per-merge
   # builds stay on GHCR (server-staging below).
   server:
     image: registry.slatepanel.app/slate/server:production
     container_name: slate-server
     restart: unless-stopped
     labels:
-      - "com.centurylinklabs.watchtower.enable=true"
+      # Its image is updated by the stack updater (`updater` below), not
+      # Watchtower: automatically, or on Update Now when Automatic Updates are
+      # off (wave 11, owner 2026-09-28). Same label on every production service.
+      - "com.slatepanel.updater.enable=true"
     ports:
       - "8080:8080"      # HTTP API + admin + viewer (LAN only)
       # WebSocket shares the HTTP port; WebRTC signaling rides the same server.
@@ -43,9 +47,15 @@ services:
       # creates under /data is persisted for free, no compose-file edit or
       # redeploy needed.
       - slate-data:/data
+      # Remote access (backlog 16.5): the control and ingress sockets the
+      # `tunnel` sidecar below talks to. Its own small volume, so the sidecar
+      # never mounts slate-data (and so never sees the identity key or the
+      # database).
+      - slate-remote:/run/slate-remote
     environment:
       - NODE_ENV=production
       - SLATE_DATA_DIR=/data
+      - SLATE_REMOTE_SOCKET_DIR=/run/slate-remote
       # Doorbell video (backlog 5.8 Phase 2). On the compose bridge network
       # the sidecar is reachable by service name; the server code's own
       # defaults are loopback, because the *supported* deployment is host
@@ -142,7 +152,7 @@ services:
     container_name: slate-mediamtx
     restart: unless-stopped
     labels:
-      - "com.centurylinklabs.watchtower.enable=true"
+      - "com.slatepanel.updater.enable=true"
     ports:
       # WebRTC/WHEP signalling and the ICE mux, LAN only (see the note at the
       # top of this file). RTSP (8554) is deliberately NOT published: only the
@@ -201,7 +211,7 @@ services:
     container_name: slate-caddy
     restart: unless-stopped
     labels:
-      - "com.centurylinklabs.watchtower.enable=true"
+      - "com.slatepanel.updater.enable=true"
     # No depends_on: [server] - Caddy doesn't need it (reverse_proxy just
     # 502s until the upstream is reachable, standard behavior) and the
     # dependency previously forced a pull of the private `server` image as
@@ -256,7 +266,7 @@ services:
     container_name: slate-soloist
     restart: unless-stopped
     labels:
-      - "com.centurylinklabs.watchtower.enable=true"
+      - "com.slatepanel.updater.enable=true"
     ports:
       - "127.0.0.1:47820:47820"
       - "127.0.0.1:47821:47821"
@@ -275,16 +285,43 @@ services:
       # back at its next start.
       - slate-soloist-data:/data
 
-  # Pull-based updater: polls ghcr.io and restarts labeled containers on a
-  # new image (issue 0.4). Same plain interval-polling behavior on every
-  # host - production's deliberateness comes entirely from `server` tracking
-  # a manually-promoted :production tag above, not from Watchtower itself
-  # doing anything different there (issue 0.11 revision - an earlier version
-  # of this used Watchtower's HTTP-API trigger mode instead; dropped in
-  # favor of this simpler, lower-surface design). Label-scoped, so it only
-  # ever touches server/server-staging/caddy, never anything else running
-  # on the host. Registry auth comes from the host's own `docker login`
-  # (see ../infra/README.md); no credentials live in this repo.
+  # Remote access (backlog 16.5, NC-4; slate-portal docs/remote-broker.md).
+  # IDLE UNLESS the admin has turned Remote access on AND the portal allowed
+  # it: it asks the server every few seconds and only then keeps ONE outbound
+  # TLS connection to Slate's broker (tunnel.slatepanel.app:443, compiled in
+  # along with the broker's pinned key - there is no setting for either). Phone
+  # connections arrive over that connection and are handed to the server's
+  # remote-only listener, a Unix socket on the slate-remote volume. Nothing is
+  # published or listened on here: no port forwarding, no public address.
+  #
+  # Unprivileged, bridge network even under host networking (it needs no LAN),
+  # and it mounts only slate-remote. The server signs each hello itself over
+  # the control socket; the identity key never leaves the server.
+  #
+  # `:production` is moved by .github/workflows/promote-tunnel.yml, which a
+  # server promotion also calls. No depends_on, for the reason given on caddy.
+  tunnel:
+    image: registry.slatepanel.app/slate/tunnel:production
+    container_name: slate-tunnel
+    restart: unless-stopped
+    labels:
+      - "com.slatepanel.updater.enable=true"
+    volumes:
+      - slate-remote:/run/slate-remote
+    environment:
+      - SLATE_REMOTE_SOCKET_DIR=/run/slate-remote
+
+  # Pull-based updater for STAGING and DEV only since wave 11 (owner,
+  # 2026-09-28): it polls and restarts containers labelled
+  # com.centurylinklabs.watchtower.enable=true, and in this file that is only
+  # `server-staging` (infra/docker-compose.dev.yml adds it back for the dev
+  # host). Production services carry com.slatepanel.updater.enable=true
+  # instead and are updated by the stack `updater` below, which honours the
+  # admin panel's Automatic Updates switch. An install whose updater predates
+  # this still has the old labels, and Watchtower keeps updating it exactly
+  # as before, until the new updater delivers this file. Registry auth comes
+  # from the host's own `docker login` (see ../infra/README.md); no
+  # credentials live in this repo.
   #
   # WATCHTOWER_POLL_INTERVAL is host-tunable via .env (compose's own ${VAR}
   # substitution, reading the project-root .env directly - distinct from
@@ -304,15 +341,21 @@ services:
       - WATCHTOWER_POLL_INTERVAL=${WATCHTOWER_POLL_INTERVAL:-300}
 
   # The stack updater (owner, 2026-09-26: "server updates for pretty much
-  # anything without rerunning an installer"). Watchtower swaps IMAGES; this
-  # swaps the FILES - this docker-compose.yml, the host-network override and
-  # .env.example - which nothing else ever changed after the installer wrote
-  # them. The image carries the release's copies; on every start (and
-  # Watchtower restarts it whenever a promotion moves `:production`) it
-  # validates them against this install's .env and docker-compose.local.yml,
-  # backs up and replaces the host's copies, `up`s only the services whose
-  # definition changed, health-checks, and rolls back on failure. It never
-  # writes .env or docker-compose.local.yml. See infra/README.md.
+  # anything without rerunning an installer"). It swaps the FILES - this
+  # docker-compose.yml, the host-network override and .env.example - which
+  # nothing else ever changed after the installer wrote them. The image
+  # carries the release's copies; on every start it validates them against
+  # this install's .env and docker-compose.local.yml, backs up and replaces
+  # the host's copies, `up`s only the services whose definition changed,
+  # health-checks, and rolls back on failure. It never writes .env or
+  # docker-compose.local.yml.
+  #
+  # Since wave 11 (owner, 2026-09-28: "Auto update is enabled by default. If
+  # it's disabled, then click to update applies.") it is also the ONE thing
+  # that updates production IMAGES: every service labelled
+  # com.slatepanel.updater.enable=true, itself included. With Automatic
+  # Updates on it pulls every 300 s (SLATE_UPDATER_POLL_SECONDS); with them
+  # off it waits for Update Now. See infra/README.md.
   #
   # Same privilege class as `watchtower`: the Docker socket, plus the install
   # directory mounted AT ITS OWN PATH, so compose run from inside resolves
@@ -321,20 +364,21 @@ services:
   # directory); SLATE_INSTALL_DIR names the same path for the target, and the
   # installer writes it into .env - /opt/slate is the installer's default.
   #
-  # Listens on nothing. Its report goes to the server's data volume
-  # (/data/stack-updater/status.json), which the admin panel's System >
-  # Settings page reads.
+  # Listens on nothing. It talks to the server only through files on the
+  # server's data volume (/data/stack-updater/): its report (status.json) and
+  # heartbeat (agent.json) one way, the Automatic Updates policy
+  # (policy.json) and an Update Now request (request.json) the other.
   updater:
     image: registry.slatepanel.app/slate/updater:production
     container_name: slate-updater
     restart: unless-stopped
     labels:
-      - "com.centurylinklabs.watchtower.enable=true"
+      - "com.slatepanel.updater.enable=true"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - .:${SLATE_INSTALL_DIR:-/opt/slate}
-      # Registry sign-in, for pulling an image a new service needs - the
-      # same credential Watchtower reads.
+      # Registry sign-in, for pulling the promoted images - the same
+      # credential Watchtower reads.
       - ${HOME}/.docker:/config:ro
       - slate-data:/srv/slate
     environment:
@@ -354,3 +398,4 @@ volumes:
   slate-caddy-data:
   slate-caddy-config:
   slate-soloist-data:
+  slate-remote:

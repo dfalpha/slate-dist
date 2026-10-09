@@ -109,6 +109,17 @@ step() {
     printf '\n== %s\n' "$*"
 }
 
+# A machine-readable milestone for SlateSetup.exe's step list: `##slate step
+# <id> <start|end>`. Only when the Windows installer asks for it
+# (SLATE_PROGRESS_MARKERS=1, forwarded through WSLENV), so a person running this
+# by hand on Linux never sees it. Always succeeds, under `set -e`.
+progress() {
+    if [ "${SLATE_PROGRESS_MARKERS:-}" = 1 ]; then
+        printf '##slate step %s %s\n' "$1" "$2"
+    fi
+    return 0
+}
+
 die() {
     printf '\nERROR: %s\n' "$*" >&2
     exit 1
@@ -516,6 +527,9 @@ registry_device_flow() {
     log "Approve this machine with your Slate account to download Slate:"
     log "  1. Open   $verify_uri"
     log "  2. Enter  $user_code"
+    if [ "${SLATE_PROGRESS_MARKERS:-}" = 1 ]; then
+        printf '##slate code %s %s\n' "$user_code" "${verify_full:-$verify_uri}"
+    fi
     log "Sign in with the account that holds your Slate licence. The code lasts"
     log "ten minutes; this installer carries on by itself once you approve."
     if find_desktop_session; then
@@ -865,15 +879,21 @@ stack_up() {
 '             "$INSTALL_DIR/docker-compose.yml"             "$INSTALL_DIR/infra/docker-compose.host-network.yml"             "$COMPOSE_SERVICES"
         info "[dry-run] caddy is in that list with or without a hostname - the"
         info "[dry-run] server configures it over its admin API once linked."
+        progress pull end
+        progress start start
+        progress start end
         return 0
     fi
     registry_sign_in
     pull_images
+    progress pull end
+    progress start start
     # Word splitting is intended here - it is a service list.
     # shellcheck disable=SC2086
     compose up -d $COMPOSE_SERVICES ||
         die "'docker compose up' failed. Run it by hand in $INSTALL_DIR to see why."
     info "Containers started."
+    progress start end
 }
 
 # A refusal with a STORED credential means it was withdrawn from the portal or
@@ -1246,10 +1266,15 @@ if [ "$DRY_RUN" -eq 1 ]; then
 fi
 
 preflight
+progress docker start
 ensure_docker
+progress docker end
+progress pull start
 fetch_stack_files
 write_env
 stack_up
+progress verify start
 verify_host_network
 wait_for_server
+progress verify end
 finish
