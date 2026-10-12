@@ -896,14 +896,96 @@ stack_up() {
     progress start end
 }
 
+# Download progress for SlateSetup.exe's step bar (owner, 2026-10-12: "We
+# should be showing download progress"). Reads `docker compose --progress json
+# pull` on stdin - one JSON object per line, measured 2026-10-12 on Compose
+# v5.5.1: per layer, "Downloading" lines carry "current" and "total" bytes,
+# then "Download complete", "Extracting" (no usable numbers) and "Pull
+# complete". Prints `##slate pct pull <0-100> <text>`: 80% for the bytes
+# downloaded so far, 20% for layers unpacked. Layer sizes only become known as
+# each layer starts downloading, so the percentage never moves backwards, and
+# a line goes out only when it moved, or every 4 MB, or a layer finished.
+# Plain awk (mawk on Ubuntu), so nothing extra is installed for it.
+pull_progress_filter() {
+    awk '
+    function num(s, k) {
+        if (match(s, "\"" k "\":[0-9]+")) return substr(s, RSTART + length(k) + 3, RLENGTH - length(k) - 3) + 0
+        return -1
+    }
+    function str(s, k) {
+        if (match(s, "\"" k "\":\"[^\"]*\"")) return substr(s, RSTART + length(k) + 4, RLENGTH - length(k) - 5)
+        return ""
+    }
+    function human(b) {
+        if (b >= 1000000000) return sprintf("%.1f GB", b / 1000000000)
+        return sprintf("%d MB", b / 1000000)
+    }
+    BEGIN { last = 0; lastgot = -1; lastdone = -1; layers = 0 }
+    /"error":true/ { m = $0; sub(/.*"message":"/, "", m); sub(/"}$/, "", m); gsub(/\\"/, "\"", m); print "  " m; fflush(); next }
+    !/"parent_id"/ {
+        if (str($0, "text") == "Pulled") { id = str($0, "id"); sub(/^Image /, "", id); print "  Pulled " id; fflush() }
+        next
+    }
+    {
+        id = str($0, "id"); t = str($0, "text")
+        # Only real layers are unpacked; the config blob shows up as a bare
+        # "Download complete" and would otherwise never count as done.
+        if ((t == "Pulling fs layer" || t == "Waiting" || t == "Already exists") && !(id in layer)) { layer[id] = 1; layers++ }
+        seen[id] = 1
+        tot = num($0, "total"); cur = num($0, "current")
+        if (t == "Downloading" && tot > 0) { size[id] = tot; got[id] = cur }
+        else if (t == "Download complete" || t == "Verifying Checksum" || t == "Extracting") { if (id in size) got[id] = size[id] }
+        else if (t == "Pull complete" || t == "Already exists") { if (id in size) got[id] = size[id]; done[id] = 1 }
+        sb = 0; sg = 0; nd = 0
+        for (k in seen) { if (k in size) { sb += size[k]; sg += got[k] } if ((k in done) && (k in layer)) nd++ }
+        p = 0
+        if (sb > 0) p += 80 * sg / sb
+        if (layers > 0) p += 20 * nd / layers
+        p = int(p); if (p > 99) p = 99; if (p < last) p = last
+        if (p == last && nd == lastdone && sg - lastgot < 4000000) next
+        if (sb == 0 && nd == 0) msg = "Starting the download"
+        else if (sg < sb) msg = "Downloading " human(sg) " of " human(sb)
+        else msg = "Unpacking: " nd " of " layers " layers done"
+        printf "##slate pct pull %d %s\n", p, msg; fflush()
+        last = p; lastgot = sg; lastdone = nd
+    }'
+}
+
+# `compose pull` into $1 (its full output, for the error checks below). For
+# SlateSetup.exe it is measured: JSON progress through the filter above, the
+# raw JSON still in $1. A Compose too old for `--progress json` refuses the
+# flag at once, and the plain pull runs instead - the bar then just keeps
+# moving without a percentage. By hand, nothing changes.
+pull_into() {
+    pull_out=$1
+    if [ "${SLATE_PROGRESS_MARKERS:-}" != 1 ]; then
+        # shellcheck disable=SC2086
+        compose pull $COMPOSE_SERVICES >"$pull_out" 2>&1
+        return
+    fi
+    pull_status=$(mktemp)
+    # The exit status goes through a file (a pipeline loses it), and
+    # `|| pull_rc=$?` keeps `set -e` from ending the group before it is written.
+    # shellcheck disable=SC2086
+    { pull_rc=0; compose --progress json pull $COMPOSE_SERVICES 2>&1 || pull_rc=$?; printf '%s\n' "$pull_rc" >"$pull_status"; } |
+        tee "$pull_out" | pull_progress_filter
+    pull_rc=$(cat "$pull_status")
+    rm -f "$pull_status"
+    if [ "$pull_rc" != 0 ] && grep -qiE 'unknown flag|invalid argument|unknown shorthand' "$pull_out"; then
+        # shellcheck disable=SC2086
+        compose pull $COMPOSE_SERVICES >"$pull_out" 2>&1
+        return
+    fi
+    return "$pull_rc"
+}
+
 # A refusal with a STORED credential means it was withdrawn from the portal or
 # the account's licence has lapsed: sign in afresh once, then pull again. Any
 # other failure (no network, a typo in the compose file) is reported as itself.
 pull_images() {
     info "Pulling images from $SLATE_REGISTRY."
     pull_log=$(mktemp)
-    # shellcheck disable=SC2086
-    if compose pull $COMPOSE_SERVICES >"$pull_log" 2>&1; then
+    if pull_into "$pull_log"; then
         rm -f "$pull_log"
         return 0
     fi
@@ -918,9 +1000,13 @@ pull_images() {
     REGISTRY_USER=""
     REGISTRY_TOKEN=""
     registry_sign_in force
-    # shellcheck disable=SC2086
-    compose pull $COMPOSE_SERVICES ||
+    pull_log=$(mktemp)
+    if ! pull_into "$pull_log"; then
+        cat "$pull_log" >&2
+        rm -f "$pull_log"
         die "Could not pull the Slate images even after signing in again. Check the Slate account at $SLATE_PORTAL has an active licence."
+    fi
+    rm -f "$pull_log"
 }
 
 # ------------------------------------------------------------- verification
