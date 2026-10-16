@@ -487,6 +487,11 @@ function Invoke-RegistrySignIn {
             # WSLENV (Invoke-LinuxInstaller). Never printed, never on disk here.
             $env:SLATE_REGISTRY_USER = $answer.username
             $env:SLATE_REGISTRY_TOKEN = $answer.password
+            # Sign in once (owner, 2026-10-12): the single-use account link
+            # grant, which the Linux installer hands to the server so the setup
+            # wizard does not ask for the password again. Same rules: memory
+            # and WSLENV only, never printed. Older portals send none.
+            if ($answer.link_grant) { $env:SLATE_LINK_GRANT = [string]$answer.link_grant }
             $answer = $null
             $body = $null
             Say "Approved."
@@ -539,7 +544,7 @@ function Invoke-LinuxInstaller {
     # it at the end and opens it on Windows (Show-FirstSetup).
     $env:SLATE_FIRST_SETUP = 'none'
     $env:SLATE_INSTALLER_OS = 'windows'
-    $env:WSLENV = 'SLATE_REGISTRY_USER:SLATE_REGISTRY_TOKEN:SLATE_INSTALLER_OS:SLATE_DIST_RAW:SLATE_FIRST_SETUP:SLATE_PROGRESS_MARKERS:WSL_UTF8'
+    $env:WSLENV = 'SLATE_REGISTRY_USER:SLATE_REGISTRY_TOKEN:SLATE_LINK_GRANT:SLATE_INSTALLER_OS:SLATE_DIST_RAW:SLATE_FIRST_SETUP:SLATE_PROGRESS_MARKERS:WSL_UTF8'
     # The house's zone, read here because the distro cannot see it. Nothing is
     # forwarded when it is unknown; the Linux installer then detects its own.
     $houseTz = Get-HouseTimeZone

@@ -96,6 +96,15 @@ PREFLIGHT_PROBLEMS=0
 REGISTRY_USER="${SLATE_REGISTRY_USER:-}"
 REGISTRY_TOKEN="${SLATE_REGISTRY_TOKEN:-}"
 
+# SIGN IN ONCE (owner, 2026-10-12): the same approval also returns a
+# single-use link grant, which the server redeems on first boot for its own
+# account session, so the setup wizard does not ask for the password again.
+# From a wrapper's sign-in (SLATE_LINK_GRANT) or this script's own. Kept in
+# memory, written only onto the server's data volume (hand_over_account_grant),
+# never echoed. Unset from the environment so no child process inherits it.
+LINK_GRANT="${SLATE_LINK_GRANT:-}"
+unset SLATE_LINK_GRANT
+
 # Which installer is asking, shown to the customer on the approval page.
 SLATE_INSTALLER_OS="${SLATE_INSTALLER_OS:-linux}"
 
@@ -176,6 +185,9 @@ Environment (all optional):
   SLATE_REGISTRY_USER  A registry.slatepanel.app credential from an earlier
   SLATE_REGISTRY_TOKEN sign-in; set, the browser sign-in is skipped. Never
                        echoed, never written to the install directory.
+  SLATE_LINK_GRANT     The single-use account link grant from that sign-in;
+                       handed to the server so the setup wizard skips the
+                       Slate account password. Never echoed.
 
 Slate's images come from registry.slatepanel.app and need a Slate account
 with a licence. The installer asks for nothing: it shows a code and a link
@@ -545,6 +557,9 @@ registry_device_flow() {
         REGISTRY_USER=$(kv "$polled" username)
         REGISTRY_TOKEN=$(kv "$polled" password)
         if [ -n "$REGISTRY_USER" ] && [ -n "$REGISTRY_TOKEN" ]; then
+            # Older portals send no link_grant; the wizard then asks for the
+            # password as before.
+            LINK_GRANT=$(kv "$polled" link_grant)
             device_code=""
             polled=""
             info "Approved."
@@ -856,6 +871,31 @@ compose() {
     fi
 }
 
+# SIGN IN ONCE: put the link grant where the server looks for it on first
+# boot - account-grant, beside its portal session token
+# (server/src/licensing/session.ts: /data/identity/ on the slate-data volume),
+# mode 0600. Written through the server image itself, so the volume gets its
+# compose project name and the file its owner; the grant goes in on stdin, so
+# it is never on a command line. The server deletes the file as it reads it.
+# Failing here costs only the password prompt in the wizard, so it warns.
+hand_over_account_grant() {
+    [ -n "$LINK_GRANT" ] || return 0
+    if [ "$DRY_RUN" -eq 1 ]; then
+        info "[dry-run] would hand the account link from this sign-in to the server:"
+        info "[dry-run] account-grant (mode 0600) in /data/identity on its data volume."
+        return 0
+    fi
+    if printf '%s\n' "$LINK_GRANT" |
+        compose run --rm --no-deps -T --entrypoint sh server -c \
+            'umask 077 && mkdir -p /data/identity && cat > /data/identity/account-grant && chmod 600 /data/identity/account-grant' \
+            >/dev/null 2>&1; then
+        info "Handed this sign-in to the server: the setup wizard will not ask for your Slate account password."
+    else
+        warn "Could not hand this sign-in to the server; the setup wizard will ask for your Slate account password instead."
+    fi
+    LINK_GRANT=""
+}
+
 # CADDY STARTS EVEN WITH NO HOSTNAME, AND THAT IS THE POINT.
 #
 # This used to drop caddy from the list when SLATE_HOSTNAME was empty, because
@@ -879,6 +919,7 @@ stack_up() {
 '             "$INSTALL_DIR/docker-compose.yml"             "$INSTALL_DIR/infra/docker-compose.host-network.yml"             "$COMPOSE_SERVICES"
         info "[dry-run] caddy is in that list with or without a hostname - the"
         info "[dry-run] server configures it over its admin API once linked."
+        hand_over_account_grant
         progress pull end
         progress start start
         progress start end
@@ -888,6 +929,7 @@ stack_up() {
     pull_images
     progress pull end
     progress start start
+    hand_over_account_grant
     # Word splitting is intended here - it is a service list.
     # shellcheck disable=SC2086
     compose up -d $COMPOSE_SERVICES ||

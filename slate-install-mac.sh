@@ -472,6 +472,11 @@ SLATE_PORTAL="https://portal.slatepanel.app"
 SLATE_REGISTRY="registry.slatepanel.app"
 REGISTRY_USER="${SLATE_REGISTRY_USER:-}"
 REGISTRY_TOKEN="${SLATE_REGISTRY_TOKEN:-}"
+# SIGN IN ONCE (owner, 2026-10-12): the approval also returns a single-use
+# link grant; the Linux installer in the VM hands it to the server, so the
+# setup wizard does not ask for the Slate account password. Never echoed.
+LINK_GRANT="${SLATE_LINK_GRANT:-}"
+unset SLATE_LINK_GRANT
 
 # $1 = the key=value body, $2 = the key.
 kv() {
@@ -530,6 +535,8 @@ registry_sign_in() {
         REGISTRY_USER=$(kv "$polled" username)
         REGISTRY_TOKEN=$(kv "$polled" password)
         if [ -n "$REGISTRY_USER" ] && [ -n "$REGISTRY_TOKEN" ]; then
+            # Absent from older portals; the wizard then asks as before.
+            LINK_GRANT=$(kv "$polled" link_grant)
             device_code=""
             polled=""
             info "Approved."
@@ -589,9 +596,11 @@ run_linux_installer() {
         info "[dry-run] limactl shell $VM_NAME -- sudo sh -c '<credential on stdin>; SLATE_FIRST_SETUP=none$tz_export $inner'"
         return 0
     fi
-    # shellcheck disable=SC2016 # $u and $t expand inside the VM, on purpose.
-    printf '%s\n%s\n' "$REGISTRY_USER" "$REGISTRY_TOKEN" |
-        limactl shell "$VM_NAME" -- sudo sh -c 'read -r u; read -r t; export SLATE_REGISTRY_USER="$u" SLATE_REGISTRY_TOKEN="$t" SLATE_FIRST_SETUP=none SLATE_INSTALLER_OS=mac'"$tz_export; $inner" ||
+    # The link grant (sign in once) rides on the same stdin as a third line,
+    # empty when there is none.
+    # shellcheck disable=SC2016 # $u, $t and $g expand inside the VM, on purpose.
+    printf '%s\n%s\n%s\n' "$REGISTRY_USER" "$REGISTRY_TOKEN" "$LINK_GRANT" |
+        limactl shell "$VM_NAME" -- sudo sh -c 'read -r u; read -r t; read -r g; export SLATE_REGISTRY_USER="$u" SLATE_REGISTRY_TOKEN="$t" SLATE_LINK_GRANT="$g" SLATE_FIRST_SETUP=none SLATE_INSTALLER_OS=mac'"$tz_export; $inner" ||
         die "The Linux installer failed inside the VM. Its own message above says why; re-run this script once it is fixed - everything up to here is reused."
 }
 
