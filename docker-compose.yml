@@ -67,6 +67,9 @@ services:
       # network; infra/docker-compose.host-network.yml points it at loopback.
       - SLATE_SOLOIST_HOST=soloist
       - SLATE_DOORBELL_WHEP_URL=http://mediamtx:8889/doorbell/whep
+      # The light show's stems sidecar (`stems` below), by service name; the
+      # host-network override points it at loopback.
+      - SLATE_STEMS_URL=http://stems:8090
     # Optional, host-local, git-ignored - the one value that still needs an
     # env var at all: SLATE_ADMIN_PASSWORD, for the very first login before
     # it can be rotated from the admin panel (issue 0.8). Everything else
@@ -284,6 +287,44 @@ services:
       # a re-download and a re-pair, not lost music - the server hands the key
       # back at its next start.
       - slate-soloist-data:/data
+
+  # Real stems for learned light-show songs (lightshow-v3 §16.1, slice D2b;
+  # infra/stems/, licences in docs/plans/stems-licence.md). After a song has
+  # played whole on Slate's own player, the server sends its PCM here - from
+  # memory, never a file - and gets back per-stem energy and onset envelopes.
+  # Only the envelopes are kept; stems never exist as audio outside this
+  # container's memory. It does nothing unless a light show has the `stems`
+  # option on, which is off by default.
+  #
+  # LOW PRIORITY BY CONSTRUCTION: niceness 19 (the image's CMD), two torch
+  # threads, at most 2 CPUs and 2.5 GB (the prod gate, 2026-10-21: 15.7 s per
+  # audio minute at --cpus 2, peak RSS 1.6 GB), a quarter of the default CPU
+  # weight, and first in line for the OOM killer. One song at a time; the
+  # server skips a job while the host is busy.
+  #
+  # Internal only: no `ports:` here, so nothing on the LAN can reach it; the
+  # server finds it by service name on this network. The host-network
+  # override publishes it to loopback for a server in the host's namespace.
+  #
+  # `:production` is moved by .github/workflows/promote-stems.yml, which a
+  # server promotion also calls (before the updater ships this file). No
+  # depends_on, for the reason given on caddy.
+  stems:
+    image: registry.slatepanel.app/slate/stems:production
+    container_name: slate-stems
+    restart: unless-stopped
+    labels:
+      - "com.slatepanel.updater.enable=true"
+    cpus: 2
+    mem_limit: 2.5g
+    cpu_shares: 256
+    oom_score_adj: 500
+    environment:
+      - STEMS_THREADS=2
+      - STEMS_NITER=0
+      # The model loads on the first job and is dropped after this long unused,
+      # so an install that never turns the stems option on holds no model.
+      - STEMS_IDLE_UNLOAD_SECONDS=600
 
   # Remote access (backlog 16.5, NC-4; slate-portal docs/remote-broker.md).
   # IDLE UNLESS the admin has turned Remote access on AND the portal allowed

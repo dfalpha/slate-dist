@@ -49,6 +49,9 @@ services:
       # `soloist` stays on the bridge network (see docker-compose.yml) and
       # publishes its ports to loopback, which is this namespace.
       - SLATE_SOLOIST_HOST=127.0.0.1
+      # `stems` likewise stays on the bridge network, published to loopback
+      # only (below).
+      - SLATE_STEMS_URL=http://127.0.0.1:47812
 
   server-staging:
     network_mode: host
@@ -87,3 +90,10 @@ services:
     network_mode: host
     environment:
       - SLATE_UPDATER_HEALTH_URL=http://127.0.0.1:8080/health
+
+  # The light show's stems sidecar stays on the bridge network (it needs no
+  # LAN) and, for the server in this namespace, is published to LOOPBACK ONLY:
+  # 127.0.0.1:47812, never the LAN. Same pattern as `soloist`.
+  stems:
+    ports:
+      - "127.0.0.1:47812:8090"

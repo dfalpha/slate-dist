@@ -69,8 +69,10 @@ SLATE_PORTAL_LINK_URL="https://portal.slatepanel.app/account/link"
 # player (build PR 4): without it Spotify is simply off. updater is the stack
 # updater (infra/updater/): it keeps docker-compose.yml and the host-network
 # override at the promoted release from here on, so a compose change never
-# again needs this installer re-run.
-COMPOSE_SERVICES="server caddy watchtower mediamtx soloist updater"
+# again needs this installer re-run. stems is the light show's learned-song
+# stem sidecar (lightshow-v3 D2b): it holds no model in memory until the
+# admin's stems option sends it a job, so starting it everywhere is cheap.
+COMPOSE_SERVICES="server caddy watchtower mediamtx soloist updater stems tunnel"
 
 # The host-shell command that prints (or with --new, rotates) the server's
 # single-use first-setup link. The server mints the token itself on its first
