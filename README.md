@@ -13,4 +13,4 @@ Install a Slate server:
 | Windows 11 | `irm https://get.slatepanel.app/windows \| iex` (elevated PowerShell 7) |
 | macOS (beta) | `curl -fsSL https://get.slatepanel.app/mac \| sh` |
 
-Mirrored from slate@158be64d9a625673706c4b3f0d63c24e942a9236.
+Mirrored from slate@9c95b37c363bc562e01dfadc77f31666cc112910.
